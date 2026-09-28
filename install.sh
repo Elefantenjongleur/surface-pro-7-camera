@@ -9,8 +9,10 @@
 #   x86_64
 #   kernel 6.19.8-3.surface.fc43.x86_64
 #
-# This installer deliberately targets the exact configuration on which the
-# rear OV8865 camera stack was validated. It is not a generic Surface installer.
+# The default mode targets the exact configuration on which the rear OV8865
+# camera stack was validated. --allow-untested-distro permits deliberate
+# experiments on other distributions/kernel versions while retaining the
+# Surface Pro 7, x86_64, IPU4P, kernel-build-tree and Secure Boot checks.
 
 set -euo pipefail
 
@@ -62,17 +64,34 @@ trap cleanup EXIT
 
 # SP7_BUILD_ONLY_MODE_V1
 BUILD_ONLY=0
+ALLOW_UNTESTED_DISTRO=0
 
-case "${1:-}" in
-    --build-only)
-        BUILD_ONLY=1
-        ;;
-    "")
-        ;;
-    *)
-        die "Usage: $0 [--build-only]"
-        ;;
-esac
+for arg in "$@"; do
+    case "$arg" in
+        --build-only)
+            BUILD_ONLY=1
+            ;;
+        --allow-untested-distro)
+            ALLOW_UNTESTED_DISTRO=1
+            ;;
+        -h|--help)
+            cat <<EOF
+Usage: $0 [--build-only] [--allow-untested-distro]
+
+  --build-only
+      Build and verify without installing system files.
+
+  --allow-untested-distro
+      Permit deliberate testing outside the known-good Fedora 43/kernel
+      combination. Hardware and safety checks remain enforced.
+EOF
+            exit 0
+            ;;
+        *)
+            die "Usage: $0 [--build-only] [--allow-untested-distro]"
+            ;;
+    esac
+done
 
 repo_for_section()
 {
@@ -224,17 +243,41 @@ log "Surface Pro 7 camera installer – preflight"
 # shellcheck disable=SC1091
 source /etc/os-release
 
-[[ "${ID:-}" == "fedora" ]] \
-    || die "This release supports Fedora only."
+KNOWN_GOOD_DISTRO=0
 
-[[ "${VERSION_ID:-}" == "$EXPECTED_FEDORA" ]] \
-    || die "This release supports Fedora $EXPECTED_FEDORA only."
+if [[ "${ID:-}" == "fedora" && "${VERSION_ID:-}" == "$EXPECTED_FEDORA" ]]; then
+    KNOWN_GOOD_DISTRO=1
+    echo "PASS: known-good distribution: Fedora $EXPECTED_FEDORA"
+elif [[ "$ALLOW_UNTESTED_DISTRO" -eq 1 ]]; then
+    printf 'WARNING: untested distribution: %s\n' \
+        "${PRETTY_NAME:-${ID:-unknown}}"
+    echo "Continuing because --allow-untested-distro was requested."
+    echo "Automatic distribution package installation is disabled."
+else
+    die "Untested distribution: ${PRETTY_NAME:-${ID:-unknown}}. Use --allow-untested-distro only for deliberate experimental testing."
+fi
 
 [[ "$(uname -m)" == "$EXPECTED_ARCH" ]] \
     || die "This release supports x86_64 only."
 
-[[ "$KVER" == "$EXPECTED_KERNEL" ]] \
-    || die "Unsupported kernel: $KVER"
+if [[ "$KVER" == "$EXPECTED_KERNEL" ]]; then
+    echo "PASS: known-good kernel: $KVER"
+elif [[ "$ALLOW_UNTESTED_DISTRO" -eq 1 ]]; then
+    printf 'WARNING: untested kernel: %s\n' "$KVER"
+    printf 'Known-good kernel: %s\n' "$EXPECTED_KERNEL"
+    echo "Continuing experimentally; external modules must build against this kernel."
+else
+    die "Untested kernel: $KVER. Expected $EXPECTED_KERNEL. Use --allow-untested-distro only for deliberate experimental testing."
+fi
+
+KNOWN_GOOD_CONFIG=0
+
+if [[ "$KNOWN_GOOD_DISTRO" -eq 1 && "$KVER" == "$EXPECTED_KERNEL" ]]; then
+    KNOWN_GOOD_CONFIG=1
+else
+    echo "WARNING: this is not the complete known-good Fedora/kernel combination."
+    echo "Experimental mode: automatic distribution package installation is disabled."
+fi
 
 PRODUCT="$(cat /sys/class/dmi/id/product_name 2>/dev/null || true)"
 
@@ -258,8 +301,13 @@ fi
 # Build dependencies
 # -------------------------------------------------------------------------
 
-if [[ "$BUILD_ONLY" -eq 1 ]]; then
-    log "Checking build-only dependencies"
+if [[ "$BUILD_ONLY" -eq 1 || "$KNOWN_GOOD_CONFIG" -eq 0 ]]; then
+    if [[ "$BUILD_ONLY" -eq 1 ]]; then
+        log "Checking build-only dependencies"
+    else
+        log "Checking dependencies for untested distribution"
+        echo "Automatic package installation is disabled in experimental mode."
+    fi
 
     for cmd in \
         git \
@@ -280,8 +328,36 @@ if [[ "$BUILD_ONLY" -eq 1 ]]; then
         sha256sum
     do
         command -v "$cmd" >/dev/null 2>&1 \
-            || die "Build-only dependency is missing: $cmd"
+            || die "Required build dependency is missing: $cmd"
     done
+
+    if [[ "$BUILD_ONLY" -eq 0 ]]; then
+        for cmd in \
+            sudo \
+            git-lfs \
+            depmod \
+            systemctl \
+            gst-launch-1.0 \
+            gst-inspect-1.0
+        do
+            command -v "$cmd" >/dev/null 2>&1 \
+                || die "Required experimental-install dependency is missing: $cmd"
+        done
+
+        python3 -c 'import jinja2, ply, yaml' >/dev/null 2>&1 \
+            || die "Required Python modules are missing: jinja2, ply and/or yaml."
+
+        pkg-config --exists yaml-0.1 \
+            || die "Required libyaml development files are missing (pkg-config: yaml-0.1)."
+
+        pkg-config --exists libevent \
+            || die "Required libevent development files are missing (pkg-config: libevent)."
+
+        for gst_element in pipewiresrc videoconvert filesink; do
+            gst-inspect-1.0 "$gst_element" >/dev/null 2>&1 \
+                || die "Required GStreamer element is missing: $gst_element"
+        done
+    fi
 else
     log "Installing Fedora build dependencies"
 
@@ -326,7 +402,10 @@ else
 fi
 
 
-if [[ ! -e "$KDIR/Makefile" ]] && [[ "$BUILD_ONLY" -eq 0 ]]; then
+if [[ ! -e "$KDIR/Makefile" ]] && \
+   [[ "$BUILD_ONLY" -eq 0 ]] && \
+   [[ "$KNOWN_GOOD_CONFIG" -eq 1 ]]
+then
     log "Installing matching linux-surface development package"
 
     sudo dnf install -y \
@@ -335,7 +414,7 @@ if [[ ! -e "$KDIR/Makefile" ]] && [[ "$BUILD_ONLY" -eq 0 ]]; then
 fi
 
 [[ -e "$KDIR/Makefile" ]] \
-    || die "Kernel build tree is missing: $KDIR"
+    || die "Kernel build tree is missing: $KDIR. Install the headers/development package for the running kernel."
 
 # -------------------------------------------------------------------------
 # Secure Boot
@@ -1078,8 +1157,10 @@ cat <<'EOF'
  INSTALLATION COMPLETE
 ============================================================
 
-The camera stack has been installed for the exact validated SP7/Fedora/kernel
-combination.
+The camera stack has been installed for the current Surface Pro 7 system.
+Fedora Workstation 43 with kernel 6.19.8-3.surface.fc43.x86_64 is the
+known-good configuration; installations made with --allow-untested-distro
+are experimental.
 
 No camera modules have deliberately been reloaded into the current session.
 

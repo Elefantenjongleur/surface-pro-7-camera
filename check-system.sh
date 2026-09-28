@@ -8,6 +8,24 @@ EXPECTED_VERSION="43"
 EXPECTED_ARCH="x86_64"
 EXPECTED_KERNEL="6.19.8-3.surface.fc43.x86_64"
 
+ALLOW_UNTESTED_DISTRO=0
+
+for arg in "$@"; do
+    case "$arg" in
+        --allow-untested-distro)
+            ALLOW_UNTESTED_DISTRO=1
+            ;;
+        -h|--help)
+            printf 'Usage: %s [--allow-untested-distro]\n' "$0"
+            exit 0
+            ;;
+        *)
+            printf 'Usage: %s [--allow-untested-distro]\n' "$0" >&2
+            exit 2
+            ;;
+    esac
+done
+
 PASS=0
 WARN=0
 FAIL=0
@@ -43,6 +61,9 @@ PRODUCT="$(cat /sys/class/dmi/id/product_name 2>/dev/null)"
 echo "Device:       ${PRODUCT:-unknown}"
 
 case "$PRODUCT" in
+    *"Surface Pro 7+"*)
+        fail "Surface Pro 7+ is not supported by this project"
+        ;;
     *"Surface Pro 7"*)
         ok "Surface Pro 7 detected"
         ;;
@@ -64,16 +85,12 @@ fi
 
 echo "Distribution: ${PRETTY_NAME:-unknown}"
 
-if [ "$ID" = "$EXPECTED_OS" ]; then
-    ok "Fedora detected"
+if [ "$ID" = "$EXPECTED_OS" ] && [ "$VERSION_ID" = "$EXPECTED_VERSION" ]; then
+    ok "Known-good distribution: Fedora 43"
+elif [ "$ALLOW_UNTESTED_DISTRO" -eq 1 ]; then
+    warn "Untested distribution accepted for experimental testing: ${PRETTY_NAME:-unknown}"
 else
-    fail "Expected Fedora"
-fi
-
-if [ "$VERSION_ID" = "$EXPECTED_VERSION" ]; then
-    ok "Fedora 43 detected"
-else
-    fail "Expected Fedora 43; found ${VERSION_ID:-unknown}"
+    fail "Untested distribution: ${PRETTY_NAME:-unknown} (use --allow-untested-distro for deliberate experimental testing)"
 fi
 
 # ------------------------------------------------------------
@@ -98,18 +115,20 @@ echo "Kernel:       $KERNEL"
 
 if [ "$KERNEL" = "$EXPECTED_KERNEL" ]; then
     ok "Validated linux-surface kernel detected"
+elif [ "$ALLOW_UNTESTED_DISTRO" -eq 1 ]; then
+    warn "Untested kernel accepted for experimental testing: $KERNEL"
 else
-    fail "Expected kernel $EXPECTED_KERNEL"
+    fail "Expected kernel $EXPECTED_KERNEL (use --allow-untested-distro for deliberate experimental testing)"
 fi
 
 # ------------------------------------------------------------
 # Kernel build tree
 # ------------------------------------------------------------
 
-if [ -d "/usr/src/kernels/$KERNEL" ]; then
-    ok "Matching kernel development tree is installed"
+if [ -f "/lib/modules/$KERNEL/build/Makefile" ]; then
+    ok "Matching kernel build tree is installed"
 else
-    fail "Missing /usr/src/kernels/$KERNEL"
+    fail "Missing kernel build tree: /lib/modules/$KERNEL/build"
 fi
 
 # ------------------------------------------------------------
@@ -212,7 +231,15 @@ echo "FAIL: $FAIL"
 echo
 
 if [ "$FAIL" -eq 0 ]; then
-    echo "SUPPORTED: This system passes the mandatory v0.1 preflight checks."
+    if [ "${ID:-}" = "$EXPECTED_OS" ] &&
+       [ "${VERSION_ID:-}" = "$EXPECTED_VERSION" ] &&
+       [ "$KERNEL" = "$EXPECTED_KERNEL" ]
+    then
+        echo "SUPPORTED: This is the known-good v0.1 configuration."
+    else
+        echo "EXPERIMENTAL: Mandatory safety checks passed, but this"
+        echo "configuration has not been validated by the project."
+    fi
     RC=0
 else
     echo "UNSUPPORTED: Do not install the v0.1 camera stack on this system."

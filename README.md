@@ -72,15 +72,31 @@ actually opens one of the virtual cameras.
 
 ## Installation
 
-The installer is intentionally restricted to the exact platform on
-which this release was validated.
+The known-good configuration is Microsoft Surface Pro 7 (without Plus),
+Fedora Workstation 43 and kernel 6.19.8-3.surface.fc43.x86_64.
 
-Before installing, run:
+For the tested Fedora configuration:
 
     ./check-system.sh
+    ./install.sh
 
-The installer will refuse unsupported devices, distributions and
-kernel versions instead of guessing.
+Other distributions and kernel versions have not yet been tested. The
+camera implementation itself is not intended to be Fedora-specific.
+
+Experienced SP7 users can deliberately opt into experimental testing:
+
+    ./check-system.sh --allow-untested-distro
+    ./install.sh --allow-untested-distro
+
+In this mode the hardware and safety checks remain active, but packages
+are not installed automatically. Install the equivalent build/runtime
+dependencies for your distribution first.
+
+The flag can also be combined with the non-installing build test:
+
+    ./install.sh --build-only --allow-untested-distro
+
+Results from other distributions are very welcome.
 
 ## Source bases
 
@@ -165,10 +181,16 @@ The camera kernel modules are tied to a specific kernel ABI.
 
 Do not install modules built for another kernel.
 
-The first installer release therefore intentionally targets:
+The known-good installer configuration is:
 
     Fedora Workstation 43
     6.19.8-3.surface.fc43.x86_64
 
-Unsupported systems should fail the preflight check rather than
-receiving an untested installation.
+The default path refuses untested distribution/kernel combinations.
+With --allow-untested-distro, experienced users can deliberately test
+other combinations. The Surface Pro 7 hardware check, x86_64
+requirement, IPU4P check, matching kernel build tree and Secure Boot
+protection remain enforced.
+
+External modules are built for the running kernel and their vermagic is
+checked before installation.
