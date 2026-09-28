@@ -1,0 +1,67 @@
+Surface Pro 7 Rear Camera for Linux
+===================================
+
+This repository contains original integration code as well as patches
+against several upstream projects. It is therefore a multi-license
+repository.
+
+Repository-authored integration code
+------------------------------------
+
+Except for files below patches/ and the third-party license texts under
+LICENSES/, all repository-authored material in this repository, including
+source code, scripts, configuration and documentation, is licensed under:
+
+    SPDX-License-Identifier: GPL-2.0-or-later
+
+See:
+
+    LICENSES/GPL-2.0-or-later.txt
+
+Upstream patches
+----------------
+
+Files below patches/ are source-code deltas against their respective
+upstream projects. They remain subject to the license terms applicable
+to the upstream files they modify.
+
+In particular:
+
+* patches/kernel/
+  modifies Linux kernel source and follows the applicable Linux kernel
+  licensing terms.
+
+* patches/ipu4/
+  modifies the pinned IPU4 source base and follows the applicable
+  licensing terms of those upstream files.
+
+* patches/libcamera/
+  modifies libcamera source and follows the applicable libcamera
+  licensing terms of those upstream files.
+
+  The newly added ov8865.yaml contained in the libcamera patch carries
+  its own:
+
+      SPDX-License-Identifier: CC0-1.0
+
+* patches/pipewire/
+  modifies PipeWire source and follows the applicable licensing terms
+  of those upstream files.
+
+The presence of this top-level LICENSE file does not relicense upstream
+code or patches derived from upstream code.
+
+Upstream source revisions
+-------------------------
+
+The exact upstream repositories and revisions used by this project are
+recorded in:
+
+    docs/source-bases.txt
+
+License texts
+-------------
+
+Relevant license texts are collected under LICENSES/ for convenience.
+The SPDX identifiers and license notices in the respective upstream
+source files remain authoritative for upstream-derived material.

@@ -1,0 +1,11 @@
+--- a/drivers/media/pci/intel/ipu-bridge.c
++++ b/drivers/media/pci/intel/ipu-bridge.c
+@@ -601,7 +601,7 @@
+ 		goto out_pm_put;
+ 	}
+ 
+-	device_link_add(&vcm_client->dev, data->sensor, DL_FLAG_PM_RUNTIME);
++	device_link_add(&vcm_client->dev, data->sensor, DL_FLAG_PM_RUNTIME | DL_FLAG_RPM_ACTIVE);
+ 
+ 	dev_info(data->sensor, "Instantiated %s VCM\n", data->board_info.type);
+ 	put_fwnode = false; /* Ownership has passed to the i2c-client */

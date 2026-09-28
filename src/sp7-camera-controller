@@ -1,0 +1,406 @@
+#!/usr/bin/env bash
+# SPDX-License-Identifier: GPL-2.0-or-later
+
+set +e
+
+LISTENER=/usr/local/libexec/sp7-camera-client-usage
+
+RUNDIR="${XDG_RUNTIME_DIR:-/run/user/$(id -u)}"
+STATEDIR="$HOME/.local/state/sp7-camera"
+
+mkdir -p "$STATEDIR"
+
+TIMELINE="$STATEDIR/client-usage.log"
+CTRLLOG="$STATEDIR/controller.log"
+
+ACTIVE=""
+GSTPID=""
+LISTENER_PID=""
+GRACEPID=""
+
+STANDARD=0
+HQ=0
+FAST=0
+
+STOP_REQUESTED=0
+SELF=$$
+
+stamp()
+{
+    date '+%Y-%m-%d %H:%M:%S.%3N'
+}
+
+log()
+{
+    printf '%s %s\n' "$(stamp)" "$*" | tee -a "$CTRLLOG"
+}
+
+gst_alive()
+{
+    [ -n "$GSTPID" ] &&
+    kill -0 "$GSTPID" 2>/dev/null
+}
+
+cancel_grace()
+{
+    if [ -n "$GRACEPID" ]; then
+        kill "$GRACEPID" 2>/dev/null
+        wait "$GRACEPID" 2>/dev/null
+        GRACEPID=""
+    fi
+}
+
+profile()
+{
+    case "$1" in
+        standard)
+            NODE="sp7.rear.smooth"
+            WIDTH=1628
+            HEIGHT=1224
+            FPS_NUM=250000
+            FPS_DEN=8333
+            FIFO="$RUNDIR/sp7-camera-standard.fifo"
+            ;;
+
+        hq)
+            NODE="sp7.rear.hq"
+            WIDTH=3260
+            HEIGHT=2448
+            FPS_NUM=5000
+            FPS_DEN=351
+            FIFO="$RUNDIR/sp7-camera-hq.fifo"
+            ;;
+
+        fast)
+            NODE="sp7.rear.fast"
+            WIDTH=1404
+            HEIGHT=792
+            FPS_NUM=108800000
+            FPS_DEN=1813389
+            FIFO="$RUNDIR/sp7-camera-fast.fifo"
+            ;;
+
+        *)
+            return 1
+            ;;
+    esac
+
+    return 0
+}
+
+stop_stream()
+{
+    if ! gst_alive; then
+        if [ -n "$ACTIVE" ]; then
+            log "Stream $ACTIVE ist bereits beendet."
+        fi
+
+        GSTPID=""
+        ACTIVE=""
+        return
+    fi
+
+    OLD="$ACTIVE"
+    PID="$GSTPID"
+
+    log "STOP $OLD – GStreamer PID=$PID"
+
+    kill -INT "$PID" 2>/dev/null
+
+    for i in {1..30}; do
+        kill -0 "$PID" 2>/dev/null || break
+        sleep 0.1
+    done
+
+    if kill -0 "$PID" 2>/dev/null; then
+        log "SIGINT reichte nicht – SIGTERM."
+        kill -TERM "$PID" 2>/dev/null
+
+        for i in {1..20}; do
+            kill -0 "$PID" 2>/dev/null || break
+            sleep 0.1
+        done
+    fi
+
+    if kill -0 "$PID" 2>/dev/null; then
+        log "SIGTERM reichte nicht – SIGKILL als letzter Schutz."
+        kill -KILL "$PID" 2>/dev/null
+
+        for i in {1..10}; do
+            kill -0 "$PID" 2>/dev/null || break
+            sleep 0.1
+        done
+    fi
+
+    wait "$PID" 2>/dev/null
+
+    if kill -0 "$PID" 2>/dev/null; then
+        log "FEHLER: alter Stream PID=$PID lebt weiterhin."
+        return 1
+    fi
+
+    GSTPID=""
+    ACTIVE=""
+
+    log "STOP $OLD abgeschlossen."
+    return 0
+}
+
+start_stream()
+{
+    WANT="$1"
+
+    profile "$WANT" || {
+        log "FEHLER: unbekanntes Profil $WANT"
+        return 1
+    }
+
+    if [ "$ACTIVE" = "$WANT" ] && gst_alive; then
+        return 0
+    fi
+
+    cancel_grace
+
+    if gst_alive; then
+        log "ARBITRATION: $ACTIVE -> $WANT"
+
+        stop_stream || {
+            log "SICHERHEITSSTOP: neuer Stream wird NICHT gestartet."
+            return 1
+        }
+    else
+        GSTPID=""
+        ACTIVE=""
+    fi
+
+    if [ ! -p "$FIFO" ]; then
+        log "FEHLER: FIFO fehlt: $FIFO"
+        return 1
+    fi
+
+    GSTLOG="$STATEDIR/gstreamer-$WANT.log"
+
+    : > "$GSTLOG"
+
+    log "START $WANT -> $NODE (${WIDTH}x${HEIGHT}@${FPS_NUM}/${FPS_DEN})"
+
+    gst-launch-1.0 -q \
+        pipewiresrc \
+            target-object="$NODE" \
+            always-copy=true \
+        ! queue \
+            max-size-buffers=2 \
+            max-size-bytes=0 \
+            max-size-time=0 \
+            leaky=downstream \
+        ! videoconvert \
+        ! video/x-raw,format=YUY2,width="$WIDTH",height="$HEIGHT",framerate="$FPS_NUM/$FPS_DEN" \
+        ! filesink \
+            location="$FIFO" \
+            sync=false \
+        >>"$GSTLOG" 2>&1 &
+
+    GSTPID=$!
+    ACTIVE="$WANT"
+
+    log "GStreamer PID=$GSTPID"
+
+    sleep 0.2
+
+    if ! gst_alive; then
+        wait "$GSTPID" 2>/dev/null
+        log "FEHLER: $WANT wurde unmittelbar beendet. Siehe $GSTLOG"
+        GSTPID=""
+        ACTIVE=""
+        return 1
+    fi
+
+    return 0
+}
+
+schedule_grace()
+{
+    cancel_grace
+
+    [ -z "$ACTIVE" ] && return
+
+    log "Alle CLIENT_USAGE-Zähler 0 – Grace 2000 ms."
+
+    (
+        sleep 2.0
+        kill -USR1 "$SELF" 2>/dev/null
+    ) &
+
+    GRACEPID=$!
+}
+
+handle_grace()
+{
+    GRACEPID=""
+
+    if [ "$STANDARD" -eq 0 ] &&
+       [ "$HQ" -eq 0 ] &&
+       [ "$FAST" -eq 0 ]; then
+
+        log "Grace abgelaufen – weiterhin alles count=0."
+
+        stop_stream
+    else
+        log "Grace verworfen – inzwischen wieder CLIENT_USAGE aktiv."
+    fi
+}
+
+choose_profile()
+{
+    LINE="$1"
+    WANT=""
+
+    TOTAL=$((STANDARD + HQ + FAST))
+
+    if [ "$TOTAL" -eq 0 ]; then
+        printf '%s' ""
+        return
+    fi
+
+    if [ "$TOTAL" -eq 1 ]; then
+        if [ "$STANDARD" -gt 0 ]; then
+            printf '%s' "standard"
+        elif [ "$HQ" -gt 0 ]; then
+            printf '%s' "hq"
+        else
+            printf '%s' "fast"
+        fi
+        return
+    fi
+
+    # Mehrere Reader auf verschiedenen virtuellen Kameras:
+    # Der jüngste count=1-Request gewinnt.
+    case "$LINE" in
+        *"Rear Standard"*"count=1"*)
+            WANT="standard"
+            ;;
+        *"Rear HQ"*"count=1"*)
+            WANT="hq"
+            ;;
+        *"Rear Fast"*"count=1"*)
+            WANT="fast"
+            ;;
+    esac
+
+    # Falls das aktuelle Profil weiterhin benutzt wird,
+    # darf es ohne neuen Request weiterlaufen.
+    if [ -z "$WANT" ] && [ -n "$ACTIVE" ]; then
+        case "$ACTIVE" in
+            standard)
+                [ "$STANDARD" -gt 0 ] && WANT="standard"
+                ;;
+            hq)
+                [ "$HQ" -gt 0 ] && WANT="hq"
+                ;;
+            fast)
+                [ "$FAST" -gt 0 ] && WANT="fast"
+                ;;
+        esac
+    fi
+
+    # Deterministischer Fallback.
+    if [ -z "$WANT" ]; then
+        if [ "$STANDARD" -gt 0 ]; then
+            WANT="standard"
+        elif [ "$HQ" -gt 0 ]; then
+            WANT="hq"
+        elif [ "$FAST" -gt 0 ]; then
+            WANT="fast"
+        fi
+    fi
+
+    printf '%s' "$WANT"
+}
+
+cleanup()
+{
+    STOP_REQUESTED=1
+
+    cancel_grace
+
+    if gst_alive; then
+        stop_stream
+    fi
+
+    if [ -n "$LISTENER_PID" ] &&
+       kill -0 "$LISTENER_PID" 2>/dev/null; then
+        kill -TERM "$LISTENER_PID" 2>/dev/null
+        wait "$LISTENER_PID" 2>/dev/null
+    fi
+
+    LISTENER_PID=""
+}
+
+terminate()
+{
+    log "Controller wird beendet."
+    cleanup
+}
+
+trap handle_grace USR1
+trap terminate TERM INT HUP
+
+: > "$TIMELINE"
+
+log "============================================================"
+log "SP7 Camera Controller gestartet"
+log "Debounce: 2000 ms"
+log "Arbitration: maximal ein realer OV8865-Stream"
+log "============================================================"
+
+coproc SP7LISTENER {
+    /usr/bin/stdbuf -oL -eL "$LISTENER"
+}
+
+LISTENER_PID=$SP7LISTENER_PID
+
+log "CLIENT_USAGE-Listener PID=$LISTENER_PID"
+
+while [ "$STOP_REQUESTED" -eq 0 ] &&
+      IFS= read -r line <&"${SP7LISTENER[0]}"; do
+
+    printf '%s\n' "$line" >> "$TIMELINE"
+
+    case "$line" in
+        *"STATE: Standard="*)
+            ;;
+        *)
+            continue
+            ;;
+    esac
+
+    if [[ "$line" =~ STATE:\ Standard=([0-9]+)\ HQ=([0-9]+)\ Fast=([0-9]+) ]]; then
+
+        STANDARD="${BASH_REMATCH[1]}"
+        HQ="${BASH_REMATCH[2]}"
+        FAST="${BASH_REMATCH[3]}"
+
+        log "CLIENT_USAGE: Standard=$STANDARD HQ=$HQ Fast=$FAST"
+
+        WANT="$(choose_profile "$line")"
+
+        if [ -n "$WANT" ]; then
+
+            cancel_grace
+
+            if [ "$ACTIVE" != "$WANT" ] ||
+               ! gst_alive; then
+                start_stream "$WANT"
+            fi
+
+        else
+            schedule_grace
+        fi
+    fi
+done
+
+if [ "$STOP_REQUESTED" -eq 0 ]; then
+    log "WARNUNG: CLIENT_USAGE-Listener wurde unerwartet beendet."
+fi
+
+cleanup

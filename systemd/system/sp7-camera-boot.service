@@ -1,0 +1,13 @@
+[Unit]
+Description=Surface Pro 7 IPU4P camera initialization
+After=systemd-modules-load.service local-fs.target
+Before=display-manager.service graphical.target
+
+[Service]
+Type=oneshot
+ExecStart=/usr/local/sbin/sp7-camera-boot
+RemainAfterExit=yes
+TimeoutStartSec=60
+
+[Install]
+WantedBy=multi-user.target

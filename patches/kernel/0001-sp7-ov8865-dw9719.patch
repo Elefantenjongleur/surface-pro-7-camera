@@ -1,0 +1,498 @@
+diff --git a/drivers/media/i2c/dw9719.c b/drivers/media/i2c/dw9719.c
+index 595583359..cdc66a79f 100644
+--- a/drivers/media/i2c/dw9719.c
++++ b/drivers/media/i2c/dw9719.c
+@@ -14,6 +14,7 @@
+ #include <linux/regulator/consumer.h>
+ #include <linux/types.h>
+ 
++#include <media/v4l2-device.h>
+ #include <media/v4l2-cci.h>
+ #include <media/v4l2-common.h>
+ #include <media/v4l2-ctrls.h>
+@@ -405,6 +406,29 @@ static int dw9719_probe(struct i2c_client *client)
+ 	if (ret < 0)
+ 		goto err_pm_runtime;
+ 
++	dev_info(&client->dev,
++		 "DBG async BEFORE nodes: v4l2_dev=%p devnode=%p asc_empty=%d fwnode=%pfw\\n",
++		 dw9719->sd.v4l2_dev,
++		 dw9719->sd.devnode,
++		 list_empty(&dw9719->sd.asc_list),
++		 dw9719->sd.fwnode);
++
++	if (dw9719->sd.v4l2_dev) {
++		int node_ret;
++
++		node_ret = v4l2_device_register_subdev_nodes(dw9719->sd.v4l2_dev);
++		if (node_ret)
++			dev_warn(&client->dev,
++				 "DBG register_subdev_nodes failed: %d\\n",
++				 node_ret);
++	}
++
++	dev_info(&client->dev,
++		 "DBG async AFTER nodes: v4l2_dev=%p devnode=%p asc_empty=%d\\n",
++		 dw9719->sd.v4l2_dev,
++		 dw9719->sd.devnode,
++		 list_empty(&dw9719->sd.asc_list));
++
+ 	pm_runtime_set_autosuspend_delay(&client->dev, 1000);
+ 	pm_runtime_use_autosuspend(&client->dev);
+ 	pm_runtime_put_autosuspend(&client->dev);
+@@ -451,6 +475,15 @@ MODULE_DEVICE_TABLE(of, dw9719_of_table);
+ static DEFINE_RUNTIME_DEV_PM_OPS(dw9719_pm_ops, dw9719_suspend, dw9719_resume,
+ 				 NULL);
+ 
++static const struct i2c_device_id dw9719_id_table[] = {
++	{ "dw9718s", DW9718S },
++	{ "dw9719", DW9719 },
++	{ "dw9761", DW9761 },
++	{ "dw9800k", DW9800K },
++	{ }
++};
++MODULE_DEVICE_TABLE(i2c, dw9719_id_table);
++
+ static struct i2c_driver dw9719_i2c_driver = {
+ 	.driver = {
+ 		.name = "dw9719",
+@@ -459,6 +492,7 @@ static struct i2c_driver dw9719_i2c_driver = {
+ 	},
+ 	.probe = dw9719_probe,
+ 	.remove = dw9719_remove,
++	.id_table = dw9719_id_table,
+ };
+ module_i2c_driver(dw9719_i2c_driver);
+ 
+diff --git a/drivers/media/i2c/ov8865.c b/drivers/media/i2c/ov8865.c
+index a8586df14..5c98cf8e9 100644
+--- a/drivers/media/i2c/ov8865.c
++++ b/drivers/media/i2c/ov8865.c
+@@ -579,6 +579,7 @@ struct ov8865_pll_configs {
+ 	const struct ov8865_pll1_config *pll1_config;
+ 	const struct ov8865_pll2_config *pll2_config_native;
+ 	const struct ov8865_pll2_config *pll2_config_binning;
++	const struct ov8865_pll2_config *pll2_config_fast;
+ };
+ 
+ /* Clock rate */
+@@ -661,6 +662,7 @@ struct ov8865_mode {
+ 	unsigned int blc_anchor_right_end;
+ 
+ 	bool pll2_binning;
++	bool pll2_fast;
+ 
+ 	const struct ov8865_register_value *register_values;
+ 	unsigned int register_values_count;
+@@ -781,16 +783,42 @@ static const struct ov8865_pll2_config ov8865_pll2_config_binning_24mhz = {
+ 	.sys_div		= 0,
+ };
+ 
++/*
++ * SP7 fast-binning PLL2
++ *
++ * DAC_CLK = 360 MHz
++ * SCLK = 96 MHz
++ */
++static const struct ov8865_pll2_config ov8865_pll2_config_fast_19_2mhz = {
++	.pll_pre_div_half	= 1,
++	.pll_pre_div		= 2,
++	.pll_mul		= 85,
++	.dac_div		= 2,
++	.sys_pre_div		= 5,
++	.sys_div		= 1,
++};
++
++static const struct ov8865_pll2_config ov8865_pll2_config_fast_24mhz = {
++	.pll_pre_div_half	= 1,
++	.pll_pre_div		= 0,
++	.pll_mul		= 30,
++	.dac_div		= 2,
++	.sys_pre_div		= 5,
++	.sys_div		= 1,
++};
++
+ static const struct ov8865_pll_configs ov8865_pll_configs_19_2mhz = {
+ 	.pll1_config = &ov8865_pll1_config_native_19_2mhz,
+ 	.pll2_config_native = &ov8865_pll2_config_native_19_2mhz,
+ 	.pll2_config_binning = &ov8865_pll2_config_binning_19_2mhz,
++	.pll2_config_fast = &ov8865_pll2_config_fast_19_2mhz,
+ };
+ 
+ static const struct ov8865_pll_configs ov8865_pll_configs_24mhz = {
+ 	.pll1_config = &ov8865_pll1_config_native_24mhz,
+ 	.pll2_config_native = &ov8865_pll2_config_native_24mhz,
+ 	.pll2_config_binning = &ov8865_pll2_config_binning_24mhz,
++	.pll2_config_fast = &ov8865_pll2_config_fast_24mhz,
+ };
+ 
+ static const struct ov8865_pll_configs *ov8865_pll_configs[] = {
+@@ -959,6 +987,93 @@ static const struct ov8865_register_value ov8865_register_values_binning[] = {
+ 	{ 0x4500, 0x40 },
+ };
+ 
++/*
++ * SP7 120 MHz fast-binning sensor timings.
++ *
++ * Derived conservatively from the working 72 MHz binning table:
++ * only registers which scale exactly 2:1 between the existing
++ * 72 MHz binning and 144 MHz native tables are scaled by 5/3.
++ * Non-linear sensor-control values remain in binning state.
++ * PSRAM_CTRL8 follows its exact 2:1 relationship.
++ * ADC sync 0x4500 deliberately remains at the binning value 0x40.
++ */
++static const struct ov8865_register_value ov8865_register_values_fast[] = {
++	/* Sensor */
++
++	{ 0x3700, 0x30 },
++	{ 0x3701, 0x10 },
++	{ 0x3702, 0x35 },
++	{ 0x3703, 0x21 },
++	{ 0x3704, 0x1b },
++	{ 0x3706, 0x4b },
++	{ 0x3707, 0x05 },
++	{ 0x3708, 0x30 },
++	{ 0x3709, 0x55 },
++	{ 0x370a, 0x00 },
++	{ 0x370b, 0xb8 },
++	{ 0x370c, 0x04 },
++	{ 0x3718, 0x12 },
++	{ 0x3712, 0x42 },
++	{ 0x371e, 0x19 },
++	{ 0x371f, 0x40 },
++	{ 0x3720, 0x07 },
++	{ 0x3721, 0x07 },
++	{ 0x3724, 0x03 },
++	{ 0x3725, 0x03 },
++	{ 0x3726, 0x08 },
++	{ 0x3728, 0x07 },
++	{ 0x3729, 0x02 },
++	{ 0x372a, 0x04 },
++	{ 0x372b, 0x6f },
++	{ 0x372c, 0xa3 },
++	{ 0x372d, 0x6f },
++	{ 0x372e, 0x08 },
++	{ 0x372f, 0x15 },
++	{ 0x3730, 0x01 },
++	{ 0x3731, 0x08 },
++	{ 0x3732, 0x1b },
++	{ 0x3736, 0x20 },
++	{ 0x373a, 0x03 },
++	{ 0x373b, 0x10 },
++	{ 0x373c, 0x0d },
++	{ 0x373e, 0x04 },
++	{ 0x375a, 0x08 },
++	{ 0x375b, 0x19 },
++	{ 0x375d, 0x03 },
++	{ 0x375f, 0x1b },
++	{ 0x3767, 0x1c },
++	{ 0x3772, 0x2f },
++	{ 0x3773, 0x03 },
++	{ 0x3774, 0x1d },
++	{ 0x3775, 0x12 },
++	{ 0x3776, 0x0b },
++	{ 0x37a0, 0x5b },
++	{ 0x37a1, 0x51 },
++	{ 0x37a2, 0x51 },
++	{ 0x37a3, 0x01 },
++	{ 0x37a5, 0x08 },
++	{ 0x37a7, 0x5b },
++	{ 0x37a8, 0x75 },
++	{ 0x37a9, 0x75 },
++	{ 0x37aa, 0x5b },
++	{ 0x37ab, 0x3d },
++	{ 0x37ac, 0x3d },
++	{ 0x37ad, 0x33 },
++	{ 0x37ae, 0x0d },
++	{ 0x37af, 0x0d },
++	{ 0x37b3, 0x58 },
++	{ 0x37b4, 0x58 },
++	{ 0x37b5, 0x44 },
++
++	/* PSRAM */
++
++	{ OV8865_PSRAM_CTRL8_REG, 0x0b },
++
++	/* ADC Sync */
++
++	{ 0x4500, 0x68 },
++};
++
+ static const struct ov8865_mode ov8865_modes[] = {
+ 	/* 3264x2448 */
+ 	{
+@@ -968,7 +1083,7 @@ static const struct ov8865_mode ov8865_modes[] = {
+ 
+ 		/* Vertical */
+ 		.output_size_y			= 2448,
+-		.vts				= 2470,
++		.vts				= 2600,
+ 
+ 		.size_auto			= true,
+ 		.size_auto_boundary_x		= 8,
+@@ -1117,6 +1232,73 @@ static const struct ov8865_mode ov8865_modes[] = {
+ 		.register_values_count	=
+ 			ARRAY_SIZE(ov8865_register_values_binning),
+ 	},
++	/*
++	 * 1632x918 full-FOV fast mode (SP7 120 MHz hybrid fast-binning)
++	 *
++	 * Surface Pro 7 fast mode.
++	 * OV8865 documented 2x2 fast-binning mode.
++	 *
++	 * 3264x1836 full 16:9 sensor field -> 1632x918 with 2x2 binning.
++	 * SCLK: 120 MHz via dedicated fast PLL2; hybrid sensor timings.
++	 * HTS 1923 * VTS 1040 = 60.002400096 fps @ 120 MHz.
++	 *
++	 * The binning/black-level configuration follows the
++	 * working 1632x1224 2x2 fast-binning mode.
++	 */
++	{
++		/* Horizontal */
++		.output_size_x			= 1632,
++		.hts				= 1923,
++
++		/* Vertical */
++		.output_size_y			= 918,
++		.vts				= 943,
++
++		.size_auto			= true,
++		.size_auto_boundary_x		= 8,
++		.size_auto_boundary_y		= 8,
++
++		/* Subsample increase: 2x2 fast binning */
++		.inc_x_odd			= 3,
++		.inc_x_even			= 1,
++		.inc_y_odd			= 3,
++		.inc_y_even			= 1,
++
++		/* Binning */
++		.binning_y			= true,
++		.sync_hbin			= true,
++
++		/* VFIFO */
++		.vfifo_read_start		= 116,
++
++		.ablc_num			= 8,
++		.zline_num			= 2,
++
++		/* Black Level */
++		.blc_top_zero_line_start	= 0,
++		.blc_top_zero_line_num		= 2,
++		.blc_top_black_line_start	= 4,
++		.blc_top_black_line_num		= 4,
++
++		.blc_bottom_zero_line_start	= 2,
++		.blc_bottom_zero_line_num	= 2,
++		.blc_bottom_black_line_start	= 8,
++		.blc_bottom_black_line_num	= 2,
++
++		.blc_anchor_left_start		= 288,
++		.blc_anchor_left_end		= 415,
++		.blc_anchor_right_start		= 992,
++		.blc_anchor_right_end		= 1119,
++
++		/* PLL */
++		.pll2_binning			= true,
++		.pll2_fast			= true,
++
++		/* Registers */
++		.register_values	= ov8865_register_values_fast,
++		.register_values_count	=
++			ARRAY_SIZE(ov8865_register_values_fast),
++	},
+ 	/* 800x600 (SVGA) */
+ 	{
+ 		/* Horizontal */
+@@ -1679,8 +1861,12 @@ static int ov8865_mode_pll2_configure(struct ov8865_sensor *sensor,
+ 	const struct ov8865_pll2_config *config;
+ 	int ret;
+ 
+-	config = mode->pll2_binning ? sensor->pll_configs->pll2_config_binning :
+-				      sensor->pll_configs->pll2_config_native;
++	if (mode->pll2_fast)
++		config = sensor->pll_configs->pll2_config_fast;
++	else
++		config = mode->pll2_binning ?
++			sensor->pll_configs->pll2_config_binning :
++			sensor->pll_configs->pll2_config_native;
+ 
+ 	ret = ov8865_write(sensor, OV8865_PLL_CTRL12_REG,
+ 			   OV8865_PLL_CTRL12_PRE_DIV_HALF(config->pll_pre_div_half) |
+@@ -2124,6 +2310,9 @@ static unsigned long ov8865_mode_mipi_clk_rate(struct ov8865_sensor *sensor,
+ 
+ static int ov8865_exposure_configure(struct ov8865_sensor *sensor, u32 exposure)
+ {
++	u32 requested_exposure = exposure;
++	u8 rb_hh = 0, rb_h = 0, rb_l = 0;
++	int read_ret;
+ 	int ret;
+ 
+ 	/* The sensor stores exposure in units of 1/16th of a line */
+@@ -2139,14 +2328,35 @@ static int ov8865_exposure_configure(struct ov8865_sensor *sensor, u32 exposure)
+ 	if (ret)
+ 		return ret;
+ 
+-	return ov8865_write(sensor, OV8865_EXPOSURE_CTRL_L_REG,
+-			    OV8865_EXPOSURE_CTRL_L(exposure));
++	ret = ov8865_write(sensor, OV8865_EXPOSURE_CTRL_L_REG,
++			   OV8865_EXPOSURE_CTRL_L(exposure));
++	if (ret)
++		return ret;
++
++	read_ret = ov8865_read(sensor, OV8865_EXPOSURE_CTRL_HH_REG, &rb_hh);
++	if (!read_ret)
++		read_ret = ov8865_read(sensor, OV8865_EXPOSURE_CTRL_H_REG, &rb_h);
++	if (!read_ret)
++		read_ret = ov8865_read(sensor, OV8865_EXPOSURE_CTRL_L_REG, &rb_l);
++
++	if (read_ret) {
++		dev_warn(sensor->dev,
++			 "DBG exposure readback failed: %d\n", read_ret);
++	} else {
++		dev_info(sensor->dev,
++			 "DBG exposure requested=%u programmed=0x%05x readback=0x%02x%02x%02x\n",
++			 requested_exposure, exposure, rb_hh, rb_h, rb_l);
++	}
++
++	return 0;
+ }
+ 
+ /* Gain */
+ 
+ static int ov8865_analog_gain_configure(struct ov8865_sensor *sensor, u32 gain)
+ {
++	u8 rb_h = 0, rb_l = 0, rb_mode = 0;
++	int read_ret;
+ 	int ret;
+ 
+ 	ret = ov8865_write(sensor, OV8865_GAIN_CTRL_H_REG,
+@@ -2154,8 +2364,28 @@ static int ov8865_analog_gain_configure(struct ov8865_sensor *sensor, u32 gain)
+ 	if (ret)
+ 		return ret;
+ 
+-	return ov8865_write(sensor, OV8865_GAIN_CTRL_L_REG,
+-			    OV8865_GAIN_CTRL_L(gain));
++	ret = ov8865_write(sensor, OV8865_GAIN_CTRL_L_REG,
++			   OV8865_GAIN_CTRL_L(gain));
++	if (ret)
++		return ret;
++
++	read_ret = ov8865_read(sensor, OV8865_GAIN_CTRL_H_REG, &rb_h);
++	if (!read_ret)
++		read_ret = ov8865_read(sensor, OV8865_GAIN_CTRL_L_REG, &rb_l);
++	if (!read_ret)
++		read_ret = ov8865_read(sensor, OV8865_EXPOSURE_GAIN_MANUAL_REG,
++				      &rb_mode);
++
++	if (read_ret) {
++		dev_warn(sensor->dev,
++			 "DBG analogue_gain readback failed: %d\n", read_ret);
++	} else {
++		dev_info(sensor->dev,
++			 "DBG analogue_gain requested=%u readback=0x%02x%02x reg3503=0x%02x\n",
++			 gain, rb_h, rb_l, rb_mode);
++	}
++
++	return 0;
+ }
+ 
+ /* White Balance */
+@@ -2322,6 +2552,7 @@ static int ov8865_state_init(struct ov8865_sensor *sensor)
+ 
+ /* Sensor Base */
+ 
++
+ static int ov8865_sensor_init(struct ov8865_sensor *sensor)
+ {
+ 	int ret;
+@@ -2618,11 +2849,30 @@ static int ov8865_s_stream(struct v4l2_subdev *subdev, int enable)
+ 	}
+ 
+ 	mutex_lock(&sensor->mutex);
++
++	/*
++	 * set_fmt() updates the requested software state, but when the
++	 * sensor remained powered runtime resume does not reprogram the
++	 * mode registers. Program the negotiated mode at every stream-on.
++	 */
++	if (enable) {
++		ret = ov8865_mode_configure(sensor, state->mode,
++					    state->mbus_code);
++		if (ret) {
++			mutex_unlock(&sensor->mutex);
++			pm_runtime_put(sensor->dev);
++			return ret;
++		}
++	}
++
+ 	ret = ov8865_sw_standby(sensor, !enable);
+ 	mutex_unlock(&sensor->mutex);
+ 
+-	if (ret)
++	if (ret) {
++		if (enable)
++			pm_runtime_put(sensor->dev);
+ 		return ret;
++	}
+ 
+ 	state->streaming = !!enable;
+ 
+@@ -2742,6 +2992,9 @@ static int ov8865_set_fmt(struct v4l2_subdev *subdev,
+ 				 OV8865_TIMING_MAX_VTS - mode->output_size_y,
+ 				 1, mode->vts - mode->output_size_y);
+ 
++	__v4l2_ctrl_s_ctrl(sensor->ctrls.vblank,
++			     mode->vts - mode->output_size_y);
++
+ 	hblank = mode->hts - mode->output_size_x;
+ 	__v4l2_ctrl_modify_range(sensor->ctrls.hblank, hblank, hblank, 1,
+ 				 hblank);
+diff --git a/drivers/media/v4l2-core/v4l2-async.c b/drivers/media/v4l2-core/v4l2-async.c
+index 1c08bba9e..fa0d7e774 100644
+--- a/drivers/media/v4l2-core/v4l2-async.c
++++ b/drivers/media/v4l2-core/v4l2-async.c
+@@ -332,6 +332,11 @@ static int v4l2_async_create_ancillary_links(struct v4l2_async_notifier *n,
+ 
+ 	link = media_create_ancillary_link(&n->sd->entity, &sd->entity);
+ 
++	dev_info(notifier_dev(n),
++		 "SP7DBG ancillary-result: primary=%s child=%s result=%ld\n",
++		 n->sd->name, sd->name,
++		 IS_ERR(link) ? PTR_ERR(link) : 0L);
++
+ 	return IS_ERR(link) ? PTR_ERR(link) : 0;
+ #else
+ 	return 0;
+@@ -346,6 +351,12 @@ static int v4l2_async_match_notify(struct v4l2_async_notifier *notifier,
+ 	bool registered = false;
+ 	int ret;
+ 
++	dev_info(notifier_dev(notifier),
++		 "SP7DBG match BEGIN: sd=%s function=0x%x notifier_sd=%s asc_empty=%d\n",
++		 sd->name, sd->entity.function,
++		 notifier->sd ? notifier->sd->name : "<ROOT>",
++		 list_empty(&sd->asc_list));
++
+ 	if (list_empty(&sd->asc_list)) {
+ 		ret = __v4l2_device_register_subdev(v4l2_dev, sd, sd->owner);
+ 		if (ret < 0)
+@@ -362,7 +373,18 @@ static int v4l2_async_match_notify(struct v4l2_async_notifier *notifier,
+ 		goto err_unregister_subdev;
+ 	}
+ 
++	dev_info(notifier_dev(notifier),
++		 "SP7DBG match AFTER_BOUND: sd=%s notifier_sd=%s registered=%d asc_empty=%d\n",
++		 sd->name,
++		 notifier->sd ? notifier->sd->name : "<ROOT>",
++		 registered, list_empty(&sd->asc_list));
++
+ 	if (registered) {
++		dev_info(notifier_dev(notifier),
++			 "SP7DBG creating-links: primary=%s child=%s function=0x%x\n",
++			 notifier->sd ? notifier->sd->name : "<ROOT>",
++			 sd->name, sd->entity.function);
++
+ 		/*
+ 		 * Depending of the function of the entities involved, we may
+ 		 * want to create links between them (for example between a

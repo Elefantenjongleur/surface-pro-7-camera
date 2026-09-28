@@ -1,0 +1,4 @@
+# Patch files preserve the exact whitespace of the known-good source
+# deltas. Validate them with git apply --check against their recorded
+# upstream bases instead of treating their contents as repository text.
+*.patch -whitespace

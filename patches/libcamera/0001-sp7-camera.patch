@@ -1,0 +1,1247 @@
+diff --git a/include/libcamera/internal/software_isp/software_isp.h b/include/libcamera/internal/software_isp/software_isp.h
+index 4f72dce9b..0102cc308 100644
+--- a/include/libcamera/internal/software_isp/software_isp.h
++++ b/include/libcamera/internal/software_isp/software_isp.h
+@@ -48,6 +48,7 @@ class SoftwareIsp : public Object
+ {
+ public:
+ 	SoftwareIsp(PipelineHandler *pipe, const CameraSensor *sensor,
++		    const ControlInfoMap &lensControls,
+ 		    ControlInfoMap *ipaControls);
+ 	~SoftwareIsp();
+ 
+@@ -87,10 +88,12 @@ public:
+ 	Signal<uint32_t, uint32_t> ispStatsReady;
+ 	Signal<uint32_t, const ControlList &> metadataReady;
+ 	Signal<const ControlList &> setSensorControls;
++	Signal<const ControlList &> setLensControls;
+ 
+ private:
+ 	void saveIspParams();
+ 	void setSensorCtrls(const ControlList &sensorControls);
++	void setLensCtrls(const ControlList &lensControls);
+ 	void statsReady(uint32_t frame, uint32_t bufferId);
+ 	void inputReady(FrameBuffer *input);
+ 	void outputReady(FrameBuffer *output);
+diff --git a/include/libcamera/internal/software_isp/swisp_stats.h b/include/libcamera/internal/software_isp/swisp_stats.h
+index d9d0d9be8..db3208abf 100644
+--- a/include/libcamera/internal/software_isp/swisp_stats.h
++++ b/include/libcamera/internal/software_isp/swisp_stats.h
+@@ -31,6 +31,16 @@ struct SwIspStats {
+ 	 * \brief Sums of colour channels of all the sampled pixels
+ 	 */
+ 	RGB<uint64_t> sum_;
++
++	/*
++	 * SP7 autofocus experiment.
++	 *
++	 * Sum of horizontal absolute differences between sampled green
++	 * values. A larger value should indicate more high-frequency
++	 * image detail and therefore better focus.
++	 */
++	uint64_t focusScore;
++
+ 	/**
+ 	 * \brief Number of bins in the yHistogram
+ 	 */
+diff --git a/include/libcamera/ipa/soft.mojom b/include/libcamera/ipa/soft.mojom
+index 77328c5fd..bd6775237 100644
+--- a/include/libcamera/ipa/soft.mojom
++++ b/include/libcamera/ipa/soft.mojom
+@@ -10,6 +10,7 @@ import "include/libcamera/ipa/core.mojom";
+ 
+ struct IPAConfigInfo {
+ 	libcamera.ControlInfoMap sensorControls;
++	libcamera.ControlInfoMap lensControls;
+ };
+ 
+ interface IPASoftInterface {
+@@ -17,7 +18,8 @@ interface IPASoftInterface {
+ 	     libcamera.SharedFD fdStats,
+ 	     libcamera.SharedFD fdParams,
+ 	     libcamera.IPACameraSensorInfo sensorInfo,
+-	     libcamera.ControlInfoMap sensorControls)
++	     libcamera.ControlInfoMap sensorControls,
++	     libcamera.ControlInfoMap lensControls)
+ 		=> (int32 ret, libcamera.ControlInfoMap ipaControls, bool ccmEnabled);
+ 	start() => (int32 ret);
+ 	stop();
+@@ -33,6 +35,7 @@ interface IPASoftInterface {
+ 
+ interface IPASoftEventInterface {
+ 	setSensorControls(libcamera.ControlList sensorControls);
++	setLensControls(libcamera.ControlList lensControls);
+ 	setIspParams();
+ 	metadataReady(uint32 frame, libcamera.ControlList metadata);
+ };
+diff --git a/src/ipa/simple/algorithms/agc.cpp b/src/ipa/simple/algorithms/agc.cpp
+index a13a75528..d5aca05b4 100644
+--- a/src/ipa/simple/algorithms/agc.cpp
++++ b/src/ipa/simple/algorithms/agc.cpp
+@@ -53,7 +53,7 @@ static constexpr float kExposureSatisfactory = 0.2;
+  * This replaces the fixed 10% bang-bang step with a proportional correction
+  * that converges smoothly and avoids overshooting near the target.
+  */
+-static constexpr float kExpProportionalGain = 0.04;
++static constexpr float kExpProportionalGain = 0.12;
+ 
+ /*
+  * Maximum multiplicative step per frame, to bound the correction when the
+diff --git a/src/ipa/simple/algorithms/agc.h b/src/ipa/simple/algorithms/agc.h
+index 112d9f5a1..b3e986018 100644
+--- a/src/ipa/simple/algorithms/agc.h
++++ b/src/ipa/simple/algorithms/agc.h
+@@ -26,6 +26,14 @@ public:
+ 
+ private:
+ 	void updateExposure(IPAContext &context, IPAFrameContext &frameContext, double exposureMSV);
++
++	/* SP7: geglättetes, highlight-abhängiges AE-Ziel. */
++	float exposureTarget_ = 2.20f;
++
++	bool highlightGuard_ = false;
++	unsigned int highlightGuardClearCount_ = 0;
++	double hardClipRatio_ = 0.0;
++	double nearClipRatio_ = 0.0;
+ };
+ 
+ } /* namespace ipa::soft::algorithms */
+diff --git a/src/ipa/simple/soft_simple.cpp b/src/ipa/simple/soft_simple.cpp
+index 629e1a32d..4fb4c3a0a 100644
+--- a/src/ipa/simple/soft_simple.cpp
++++ b/src/ipa/simple/soft_simple.cpp
+@@ -56,6 +56,7 @@ public:
+ 		 const SharedFD &fdParams,
+ 		 const IPACameraSensorInfo &sensorInfo,
+ 		 const ControlInfoMap &sensorControls,
++		 const ControlInfoMap &lensControls,
+ 		 ControlInfoMap *ipaControls,
+ 		 bool *ccmEnabled) override;
+ 	int configure(const IPAConfigInfo &configInfo) override;
+@@ -78,6 +79,165 @@ private:
+ 	SwIspStats *stats_;
+ 	std::unique_ptr<CameraSensorHelper> camHelper_;
+ 	ControlInfoMap sensorInfoMap_;
++	ControlInfoMap lensInfoMap_;
++
++	/*
++	 * SP7 continuous contrast autofocus experiment.
++	 *
++	 * Working hypothesis for the DW9719 optical direction:
++	 * lower positions focus farther away, with 0 approximately
++	 * representing infinity; higher positions focus nearer.
++	 *
++	 * The complete V4L2 range 0..1023 is available. Acquisition
++	 * searches in coarse steps, a fine pass refines the peak, and
++	 * the locked state monitors sharpness without moving the lens.
++	 * A sustained sharpness loss triggers a new acquisition around
++	 * the current focus position.
++	 */
++	static constexpr int32_t kSp7AfInitialPosition = 272;
++	/*
++	 * SP7 continuous autofocus:
++	 * continuously walk the contrast gradient in very small steps.
++	 */
++	static constexpr int32_t kSp7AfTrackStep = 8;
++	static constexpr uint32_t kSp7AfTrackWarmupFrames = 15;
++
++	/*
++	 * Reverse direction when the new focus score falls below 99 %
++	 * of the preceding score. Small statistical fluctuations are ignored.
++	 */
++	static constexpr uint64_t kSp7AfTrackDropNumerator = 99;
++	static constexpr uint64_t kSp7AfTrackDropDenominator = 100;
++	static constexpr unsigned int kSp7AfTrackDropConfirmations = 2;
++	static constexpr int32_t kSp7AfProbeStep = 24;
++
++	/*
++	 * Let AE/AGC settle before the first autofocus acquisition.
++	 * At ~15 fps, 30 frames correspond to roughly two seconds.
++	 */
++	static constexpr uint32_t kSp7AfAeWarmupFrames = 30;
++
++	/*
++	 * A flat contrast curve is common at longer focus distances.
++	 * Do not accept the centre as a focus peak unless it exceeds
++	 * the better side probe by at least 2%. Otherwise continue
++	 * searching towards the far-focus end of the lens range.
++	 */
++	static constexpr uint64_t kSp7AfCenterPeakNumerator = 102;
++	static constexpr uint64_t kSp7AfCenterPeakDenominator = 100;
++
++	/*
++	 * If the first coarse direction improves contrast by less
++	 * than one percent, search the opposite side once before
++	 * accepting the best focus position.
++	 */
++	static constexpr uint64_t kSp7AfCoarseGainNumerator = 101;
++	static constexpr uint64_t kSp7AfCoarseGainDenominator = 100;
++	static constexpr int32_t kSp7AfCoarseStep = 30;
++
++	/*
++	 * Adaptive contrast hill climbing:
++	 *
++	 * Start with the normal coarse step. Whenever contrast has
++	 * clearly fallen below the best value, reverse direction and
++	 * halve the step size:
++	 *
++	 *     30 -> 15 -> 8 -> 4
++	 *
++	 * A 0.5% tolerance prevents tiny statistical fluctuations from
++	 * causing needless direction changes.
++	 */
++	static constexpr int32_t kSp7AfHillMinStep = 4;
++	static constexpr uint64_t kSp7AfHillToleranceNumerator = 995;
++	static constexpr uint64_t kSp7AfHillToleranceDenominator = 1000;
++	static constexpr unsigned int kSp7AfHillMaxReversals = 6;
++	static constexpr int32_t kSp7AfFineStep = 4;
++	static constexpr int32_t kSp7AfFineRadius = 4;
++	static constexpr int32_t kSp7AfMinPosition = 0;
++	static constexpr int32_t kSp7AfMaxPosition = 1023;
++
++	/*
++	 * SP7 CDAF V3 calibration:
++	 *
++	 * The software ISP produces focus statistics only periodically.
++	 * After every VCM movement discard one statistics update and
++	 * use the next focus measurement. This trades some noise immunity
++	 * for substantially faster autofocus response.
++	 */
++	static constexpr unsigned int kSp7AfSamplesPerPosition = 1;
++	static constexpr unsigned int kSp7AfProbeSamples = 2;
++	static constexpr unsigned int kSp7AfSettleStats = 1;
++	static constexpr unsigned int kSp7AfLockedSamples = 3;
++	static constexpr unsigned int kSp7AfDropConfirmations = 3;
++
++	/*
++	 * libcamera-inspired CDAF peak detection:
++	 * keep searching through small/noisy decreases and consider the
++	 * focus peak safely passed only after contrast falls below 80%
++	 * of the best score seen during the coarse search.
++	 */
++	static constexpr uint64_t kSp7AfPeakRatioNumerator = 80;
++	static constexpr uint64_t kSp7AfPeakRatioDenominator = 100;
++
++	/*
++	 * Re-focus only after a sustained drop below 90% of the score
++	 * measured when focus was locked. This deliberately favours a
++	 * stable image over constant hunting.
++	 */
++	static constexpr uint64_t kSp7AfRelockNumerator = 90;
++	static constexpr uint64_t kSp7AfRelockDenominator = 100;
++
++	enum class Sp7AfStage {
++		Center,
++		ProbeLow,
++		ProbeHigh,
++		Coarse,
++		Fine,
++		Locked,
++	};
++
++	Sp7AfStage sp7AfStage_;
++	int32_t sp7AfPosition_;
++	int32_t sp7AfBestPosition_;
++	int32_t sp7AfDirection_;
++	int32_t sp7AfFineMin_;
++	int32_t sp7AfFineMax_;
++
++	uint64_t sp7AfCenterScore_;
++	uint64_t sp7AfLowScore_;
++	uint64_t sp7AfHighScore_;
++	uint64_t sp7AfBestScore_;
++	uint64_t sp7AfLockScore_;
++	uint64_t sp7AfScoreSum_;
++
++	unsigned int sp7AfSamples_;
++	unsigned int sp7AfDiscard_;
++	unsigned int sp7AfDropCount_;
++
++	int32_t sp7AfAdaptiveStep_ = kSp7AfCoarseStep;
++	unsigned int sp7AfHillReversals_ = 0;
++
++	int32_t sp7AfAcquisitionCenter_ = 0;
++	int32_t sp7AfInitialDirection_ = 0;
++	uint64_t sp7AfCoarseStartBestScore_ = 0;
++	bool sp7AfCoarseReversed_ = false;
++	bool sp7AfStarted_;
++
++	/*
++	 * Continuous AF tracking state. The focus score is normalized
++	 * against the exposure and gain actually used by the sensor.
++	 */
++	double sp7AfTrackPreviousScore_ = 0.0;
++	unsigned int sp7AfTrackWorseCount_ = 0;
++
++	/*
++	 * Exposure/gain are frozen only while the lens is moving through
++	 * an autofocus acquisition. This prevents AE changes from being
++	 * interpreted as changes in image sharpness.
++	 */
++	bool sp7AfExposureFrozen_ = false;
++	int32_t sp7AfFrozenExposure_ = 0;
++	int32_t sp7AfFrozenGainCode_ = 0;
+ 
+ 	/* Local parameter storage */
+ 	struct IPAContext context_;
+@@ -96,6 +256,7 @@ int IPASoftSimple::init(const IPASettings &settings,
+ 			const SharedFD &fdParams,
+ 			const IPACameraSensorInfo &sensorInfo,
+ 			const ControlInfoMap &sensorControls,
++			const ControlInfoMap &lensControls,
+ 			ControlInfoMap *ipaControls,
+ 			bool *ccmEnabled)
+ {
+@@ -107,6 +268,7 @@ int IPASoftSimple::init(const IPASettings &settings,
+ 	}
+ 
+ 	context_.sensorInfo = sensorInfo;
++	lensInfoMap_ = lensControls;
+ 
+ 	/* Load the tuning data file */
+ 	File file(settings.configurationFile);
+@@ -202,6 +364,7 @@ int IPASoftSimple::init(const IPASettings &settings,
+ int IPASoftSimple::configure(const IPAConfigInfo &configInfo)
+ {
+ 	sensorInfoMap_ = configInfo.sensorControls;
++	lensInfoMap_ = configInfo.lensControls;
+ 
+ 	const ControlInfo &exposureInfo = sensorInfoMap_.find(V4L2_CID_EXPOSURE)->second;
+ 	const ControlInfo &gainInfo = sensorInfoMap_.find(V4L2_CID_ANALOGUE_GAIN)->second;
+@@ -267,6 +430,35 @@ int IPASoftSimple::configure(const IPAConfigInfo &configInfo)
+ 
+ int IPASoftSimple::start()
+ {
++	sp7AfStage_ = Sp7AfStage::Center;
++	sp7AfPosition_ = kSp7AfInitialPosition;
++	sp7AfBestPosition_ = kSp7AfInitialPosition;
++	sp7AfDirection_ = 1;
++	sp7AfFineMin_ = kSp7AfInitialPosition;
++	sp7AfFineMax_ = kSp7AfInitialPosition;
++
++	sp7AfCenterScore_ = 0;
++	sp7AfLowScore_ = 0;
++	sp7AfHighScore_ = 0;
++	sp7AfBestScore_ = 0;
++	sp7AfLockScore_ = 0;
++	sp7AfScoreSum_ = 0;
++
++	sp7AfSamples_ = 0;
++	sp7AfDiscard_ = 1;
++	sp7AfDropCount_ = 0;
++	sp7AfStarted_ = false;
++	sp7AfTrackPreviousScore_ = 0.0;
++	sp7AfTrackWorseCount_ = 0;
++
++	LOG(IPASoft, Info)
++		<< "SP7 CONT AF: initialized position="
++		<< kSp7AfInitialPosition
++		<< " coarseStep=" << kSp7AfCoarseStep
++		<< " fineStep=" << kSp7AfFineStep
++		<< " range=" << kSp7AfMinPosition
++		<< "-" << kSp7AfMaxPosition;
++
+ 	return 0;
+ }
+ 
+@@ -307,6 +499,12 @@ void IPASoftSimple::processStats(const uint32_t frame,
+ 	frameContext.sensor.gain = camHelper_ ? camHelper_->gain(again) : again;
+ 
+ 	ControlList metadata(controls::controls);
++
++	if (stats_->valid)
++		LOG(IPASoft, Info)
++			<< "SP7 AF TEST: frame=" << frame
++			<< " focusScore=" << stats_->focusScore;
++
+ 	for (const auto &algo : algorithms())
+ 		algo->process(context_, frame, frameContext, stats_, metadata);
+ 	metadataReady.emit(frame, metadata);
+@@ -320,12 +518,162 @@ void IPASoftSimple::processStats(const uint32_t frame,
+ 
+ 	ControlList ctrls(sensorInfoMap_);
+ 
+-	auto &againNew = frameContext.sensor.gain;
++
++	/*
++	 * SP7: normal continuous AE/AGC.
++	 *
++	 * The continuous hill-climb autofocus is deliberately allowed to
++	 * coexist with AE. Small brightness-induced contrast variations may
++	 * occasionally reverse AF direction, which is harmless for this
++	 * continuously tracking controller.
++	 */
++	const double againNew = frameContext.sensor.gain;
++	const int32_t againCode = camHelper_
++		? camHelper_->gainCode(againNew)
++		: static_cast<int32_t>(againNew);
++
+ 	ctrls.set(V4L2_CID_EXPOSURE, frameContext.sensor.exposure);
+-	ctrls.set(V4L2_CID_ANALOGUE_GAIN,
+-		  static_cast<int32_t>(camHelper_ ? camHelper_->gainCode(againNew) : againNew));
++	ctrls.set(V4L2_CID_ANALOGUE_GAIN, againCode);
+ 
+ 	setSensorControls.emit(ctrls);
++
++	/*
++	 * SP7 continuous contrast autofocus.
++	 *
++	 * Continuously walk along the focus curve in small steps.
++	 * Compare the exposure/gain-normalized focus score with the
++	 * preceding lens position. If sharpness clearly decreases,
++	 * reverse direction immediately.
++	 *
++	 * There is deliberately no Locked state: around the optimum
++	 * the lens naturally oscillates by a few focus units.
++	 */
++	if (stats_->valid && frame >= kSp7AfTrackWarmupFrames) {
++		ControlList lensCtrls(lensInfoMap_);
++
++		auto clampPosition = [&](int32_t position) {
++			if (position < kSp7AfMinPosition)
++				return kSp7AfMinPosition;
++			if (position > kSp7AfMaxPosition)
++				return kSp7AfMaxPosition;
++			return position;
++		};
++
++		auto moveLens = [&](int32_t position) {
++			sp7AfPosition_ = clampPosition(position);
++
++			/*
++			 * Ignore the first statistics result after movement.
++			 * It may still belong partly to the previous lens
++			 * position.
++			 */
++			sp7AfDiscard_ = 1;
++
++			lensCtrls.set(V4L2_CID_FOCUS_ABSOLUTE,
++				      sp7AfPosition_);
++			setLensControls.emit(lensCtrls);
++		};
++
++		if (!sp7AfStarted_) {
++			sp7AfStarted_ = true;
++			sp7AfDirection_ = 1;
++			sp7AfPosition_ = kSp7AfInitialPosition;
++			sp7AfTrackPreviousScore_ = 0.0;
++			sp7AfDiscard_ = 2;
++
++			lensCtrls.set(V4L2_CID_FOCUS_ABSOLUTE,
++				      sp7AfPosition_);
++			setLensControls.emit(lensCtrls);
++
++			LOG(IPASoft, Info)
++				<< "SP7 LIVE AF: START position="
++				<< sp7AfPosition_
++				<< " step=" << kSp7AfTrackStep;
++
++		} else if (sp7AfDiscard_) {
++			--sp7AfDiscard_;
++
++		} else {
++			const uint64_t rawScore = stats_->focusScore;
++
++			const int32_t exposure =
++				sensorControls.get(V4L2_CID_EXPOSURE).get<int32_t>();
++
++			const int32_t gainCode =
++				sensorControls.get(V4L2_CID_ANALOGUE_GAIN).get<int32_t>();
++
++			const double gain = camHelper_
++				? camHelper_->gain(gainCode)
++				: static_cast<double>(gainCode);
++
++			double exposureGain =
++				static_cast<double>(exposure) * gain;
++
++			if (exposureGain < 1.0)
++				exposureGain = 1.0;
++
++			const double score =
++				static_cast<double>(rawScore) / exposureGain;
++
++			bool reversed = false;
++
++			if (sp7AfTrackPreviousScore_ > 0.0 &&
++			    score * kSp7AfTrackDropDenominator <
++				    sp7AfTrackPreviousScore_ *
++					    kSp7AfTrackDropNumerator) {
++				sp7AfDirection_ = -sp7AfDirection_;
++				reversed = true;
++
++				LOG(IPASoft, Info)
++					<< "SP7 LIVE AF: REVERSE position="
++					<< sp7AfPosition_
++					<< " previous="
++					<< sp7AfTrackPreviousScore_
++					<< " current=" << score
++					<< " direction="
++					<< sp7AfDirection_;
++			}
++
++			sp7AfTrackPreviousScore_ = score;
++
++			int32_t next =
++				clampPosition(
++					sp7AfPosition_ +
++					sp7AfDirection_ *
++						kSp7AfTrackStep);
++
++			/*
++			 * Bounce at the physical control limits.
++			 */
++			if (next == sp7AfPosition_) {
++				sp7AfDirection_ = -sp7AfDirection_;
++
++				next =
++					clampPosition(
++						sp7AfPosition_ +
++						sp7AfDirection_ *
++							kSp7AfTrackStep);
++
++				/*
++				 * Reset the comparison at an edge because the
++				 * next measurement starts a new direction.
++				 */
++				sp7AfTrackPreviousScore_ = 0.0;
++			}
++
++			LOG(IPASoft, Info)
++				<< "SP7 LIVE AF: position="
++				<< sp7AfPosition_
++				<< " score=" << score
++				<< " next=" << next
++				<< " direction="
++				<< sp7AfDirection_
++				<< " reversed=" << reversed;
++
++			if (next != sp7AfPosition_)
++				moveLens(next);
++		}
++	}
+ }
+ 
+ std::string IPASoftSimple::logPrefix() const
+diff --git a/src/libcamera/pipeline/simple/simple.cpp b/src/libcamera/pipeline/simple/simple.cpp
+index e26f438d9..468229092 100644
+--- a/src/libcamera/pipeline/simple/simple.cpp
++++ b/src/libcamera/pipeline/simple/simple.cpp
+@@ -24,6 +24,7 @@
+ #include <linux/media-bus-format.h>
+ 
+ #include <libcamera/base/log.h>
++#include <libcamera/base/utils.h>
+ 
+ #include <libcamera/camera.h>
+ #include <libcamera/color_space.h>
+@@ -35,6 +36,7 @@
+ #include "libcamera/internal/camera.h"
+ #include "libcamera/internal/camera_manager.h"
+ #include "libcamera/internal/camera_sensor.h"
++#include "libcamera/internal/camera_lens.h"
+ #include "libcamera/internal/camera_sensor_properties.h"
+ #include "libcamera/internal/converter.h"
+ #include "libcamera/internal/delayed_controls.h"
+@@ -372,6 +374,7 @@ private:
+ 	void ispStatsReady(uint32_t frame, uint32_t bufferId);
+ 	void metadataReady(uint32_t frame, const ControlList &metadata);
+ 	void setSensorControls(const ControlList &sensorControls);
++	void setLensControls(const ControlList &lensControls);
+ };
+ 
+ class SimpleCameraConfiguration : public CameraConfiguration
+@@ -597,6 +600,31 @@ int SimpleCameraData::init()
+ 	SimplePipelineHandler *pipe = SimpleCameraData::pipe();
+ 	int ret;
+ 
++	/*
++	 * Surface Pro 7 rear camera: temporary fixed-focus workaround.
++	 *
++	 * The Simple pipeline currently doesn't drive the sensor's focus lens.
++	 * The OV8865 on the Surface Pro 7 uses a DW9719 VCM. A native
++	 * V4L2 focus position of 288 gives a useful general-purpose focus
++	 * position on this device.
++	 *
++	 * This is intentionally a temporary device-specific workaround until
++	 * proper autofocus/lens control is implemented in the Simple pipeline.
++	 */
++	if (sensor_->model() == "ov8865") {
++		CameraLens *lens = sensor_->focusLens();
++
++		if (lens) {
++			ret = lens->setFocusPosition(288);
++			if (ret)
++				LOG(SimplePipeline, Warning)
++					<< "Failed to set OV8865 initial focus position";
++			else
++				LOG(SimplePipeline, Info)
++					<< "Set OV8865 initial focus position to 288";
++		}
++	}
++
+ 	/* Open the converter, if any. */
+ 	std::shared_ptr<MediaDevice> converter = pipe->converter();
+ 	if (converter) {
+@@ -615,7 +643,12 @@ int SimpleCameraData::init()
+ 	 * Instantiate Soft ISP if this is enabled for the given driver and no converter is used.
+ 	 */
+ 	if (!converter_ && pipe->swIspEnabled()) {
+-		swIsp_ = std::make_unique<SoftwareIsp>(pipe, sensor_.get(), &controlInfo_);
++		CameraLens *focusLens = sensor_->focusLens();
++		const ControlInfoMap lensControls =
++			focusLens ? focusLens->controls() : ControlInfoMap{};
++
++		swIsp_ = std::make_unique<SoftwareIsp>(pipe, sensor_.get(),
++						      lensControls, &controlInfo_);
+ 		if (!swIsp_->isValid()) {
+ 			LOG(SimplePipeline, Warning)
+ 				<< "Failed to create software ISP, disabling software debayering";
+@@ -626,6 +659,7 @@ int SimpleCameraData::init()
+ 			swIsp_->ispStatsReady.connect(this, &SimpleCameraData::ispStatsReady);
+ 			swIsp_->metadataReady.connect(this, &SimpleCameraData::metadataReady);
+ 			swIsp_->setSensorControls.connect(this, &SimpleCameraData::setSensorControls);
++			swIsp_->setLensControls.connect(this, &SimpleCameraData::setLensControls);
+ 		}
+ 	}
+ 
+@@ -1058,6 +1092,29 @@ void SimpleCameraData::setSensorControls(const ControlList &sensorControls)
+ 	}
+ }
+ 
++void SimpleCameraData::setLensControls(const ControlList &lensControls)
++{
++	CameraLens *focusLens = sensor_->focusLens();
++	if (!focusLens)
++		return;
++
++	if (!lensControls.contains(V4L2_CID_FOCUS_ABSOLUTE))
++		return;
++
++	const ControlValue &focusValue =
++		lensControls.get(V4L2_CID_FOCUS_ABSOLUTE);
++
++	LOG(SimplePipeline, Info)
++		<< "SP7 AF TEST: setting lens position "
++		<< focusValue.get<int32_t>();
++
++	int ret = focusLens->setFocusPosition(focusValue.get<int32_t>());
++	if (ret)
++		LOG(SimplePipeline, Warning)
++			<< "SP7 AF TEST: failed to set lens position: "
++			<< ret;
++}
++
+ /* Retrieve all source pads connected to a sink pad through active routes. */
+ std::vector<const MediaPad *> SimpleCameraData::routedSourcePads(MediaPad *sink)
+ {
+@@ -1240,6 +1297,87 @@ CameraConfiguration::Status SimpleCameraConfiguration::validate()
+ 	if (!pipeConfig_)
+ 		pipeConfig_ = maxPipeConfig;
+ 
++	/*
++	 * Surface Pro 7 OV8865 workaround.
++	 *
++	 * The 1632x1224 and 800x600 sensor modes currently fail to
++	 * produce frames with the IPU4P stack and leave ISYS requiring
++	 * a power cycle. 3264x1836 is known to stream reliably.
++	 *
++	 * Keep the requested output size unchanged, but force the
++	 * sensor/capture configuration to the known-good mode.
++	 */
++	if (data_->sensor_->model() == "ov8865") {
++		/*
++		 * SP7_OV8865_RUNTIME_MODE_SWITCH
++		 *
++		 * Default:
++		 *   3264x1836 - known-good ~15 fps mode.
++		 *
++		 * LIBCAMERA_SP7_OV8865_MODE=30:
++		 *   1632x1224 - native binned ~30 fps mode.
++		 *
++		 * This keeps both modes in one libcamera build so changing
++		 * the Surface Pro 7 camera mode requires only restarting
++		 * userspace, not rebuilding libcamera.
++		 */		const char *sp7Mode =
++			utils::secure_getenv("LIBCAMERA_SP7_OV8865_MODE");
++
++		const bool sp7Mode30 =
++			sp7Mode &&
++			sp7Mode[0] == '3' &&
++			sp7Mode[1] == '0' &&
++			sp7Mode[2] == 0;
++
++		/*
++		 * SP7_PER_NODE_SENSOR_CONFIG
++		 *
++		 * A CameraConfiguration sensor request has priority over
++		 * the old process-global environment switch.
++		 */
++		Size sp7SensorSize =
++			sp7Mode30 ? Size(1632, 1224)
++				    : Size(3264, 1836);
++
++		if (sensorConfig) {
++			const Size requestedSensorSize =
++				sensorConfig->outputSize;
++
++			if (requestedSensorSize == Size(3264, 2448) ||
++		    requestedSensorSize == Size(3264, 1836) ||
++		    requestedSensorSize == Size(1632, 1224) ||
++		    requestedSensorSize == Size(1632, 918))
++				sp7SensorSize = requestedSensorSize;
++		}
++
++		const bool sp7Selected1632 =
++			sp7SensorSize == Size(1632, 1224);
++
++		bool sp7ModeFound = false;
++
++		for (const SimpleCameraData::Configuration *candidate : *configs) {
++			if (candidate->sensorSize == sp7SensorSize &&
++			    candidate->captureSize == sp7SensorSize) {
++				pipeConfig_ = candidate;
++				sp7ModeFound = true;
++
++				LOG(SimplePipeline, Info)
++					<< "SP7 OV8865: runtime sensor mode "
++					<< sp7SensorSize
++					<< (sp7Selected1632
++						    ? " (SP7 smooth)"
++						    : " (SP7 hq/fast)");
++				break;
++			}
++		}
++
++		if (!sp7ModeFound)
++			LOG(SimplePipeline, Warning)
++				<< "SP7 OV8865: requested runtime sensor mode "
++				<< sp7SensorSize
++				<< " unavailable";
++	}
++
+ 	LOG(SimplePipeline, Debug)
+ 		<< "Picked "
+ 		<< V4L2SubdeviceFormat{ pipeConfig_->code, pipeConfig_->sensorSize, {} }
+@@ -1413,6 +1551,16 @@ SimplePipelineHandler::generateConfiguration(Camera *camera, Span<const StreamRo
+ 	std::unique_ptr<CameraConfiguration> config =
+ 		std::make_unique<SimpleCameraConfiguration>(camera, data);
+ 
++	/*
++	 * Surface Pro 7 rear camera orientation workaround.
++	 *
++	 * The OV8865 rear camera image is horizontally mirrored with the
++	 * default orientation. Use the same transformation as cam's
++	 * --orientation=mirror by default.
++	 */
++	if (data->sensor_->model() == "ov8865")
++		config->orientation = Orientation::Rotate0Mirror;
++
+ 	if (roles.empty())
+ 		return config;
+ 
+@@ -1605,6 +1753,11 @@ int SimplePipelineHandler::configure(Camera *camera, CameraConfiguration *c)
+ 	} else {
+ 		ipa::soft::IPAConfigInfo configInfo;
+ 		configInfo.sensorControls = data->sensor_->controls();
++
++		CameraLens *focusLens = data->sensor_->focusLens();
++		if (focusLens)
++			configInfo.lensControls = focusLens->controls();
++
+ 		return data->swIsp_->configure(inputCfg, outputCfgs, configInfo);
+ 	}
+ }
+@@ -1924,6 +2077,21 @@ bool SimplePipelineHandler::matchDevice(std::shared_ptr<MediaDevice> media,
+ 	pipelines.reserve(sensors.size());
+ 
+ 	for (MediaEntity *sensor : sensors) {
++		/*
++		 * Surface Pro 7 rear-only test.
++		 *
++		 * The OV5693 front camera currently fails to produce frames
++		 * with the IPU4P stack and can leave ISYS requiring a power
++		 * cycle. Temporarily exclude it while testing the OV8865 rear
++		 * camera through PipeWire/Snapshot.
++		 */
++		if (sensor->name().find("ov5693") != std::string::npos) {
++			LOG(SimplePipeline, Info)
++				<< "SP7 rear-only test: skipping OV5693 sensor "
++				<< sensor->name();
++			continue;
++		}
++
+ 		std::unique_ptr<SimpleCameraData> data =
+ 			std::make_unique<SimpleCameraData>(this, numStreams, sensor);
+ 		if (!data->isValid()) {
+diff --git a/src/libcamera/software_isp/debayer_cpu.cpp b/src/libcamera/software_isp/debayer_cpu.cpp
+index 49382b4c2..b4d0049c2 100644
+--- a/src/libcamera/software_isp/debayer_cpu.cpp
++++ b/src/libcamera/software_isp/debayer_cpu.cpp
+@@ -9,6 +9,7 @@
+  * CPU based debayering class
+  */
+ 
++#include <cstdlib>
+ #include "debayer_cpu.h"
+ 
+ #include <algorithm>
+@@ -660,6 +661,15 @@ int DebayerCpu::configure(const StreamConfiguration &inputCfg,
+ 
+ 	inputConfig_.stride = inputCfg.stride;
+ 
++	/*
++	 * SP7_RAW_PRESCALE_STRIDE_FIX
++	 *
++	 * Remember the real sensor-buffer stride before the RAW
++	 * prescale path replaces inputConfig_.stride with the stride
++	 * of its smaller intermediate Bayer image.
++	 */
++	sp7SourceInputStride_ = inputConfig_.stride;
++
+ 	if (outputCfgs.size() != 1) {
+ 		LOG(Debayer, Error)
+ 			<< "Unsupported number of output streams: "
+@@ -696,12 +706,139 @@ int DebayerCpu::configure(const StreamConfiguration &inputCfg,
+ 	 */
+ 	params_.gamma = 1.0;
+ 
+-	window_.x = ((inputCfg.size.width - outputCfg.size.width) / 2) &
+-		    ~(inputConfig_.patternSize.width - 1);
+-	window_.y = ((inputCfg.size.height - outputCfg.size.height) / 2) &
+-		    ~(inputConfig_.patternSize.height - 1);
+-	window_.width = outputCfg.size.width;
+-	window_.height = outputCfg.size.height;
++	/*
++	 * SP7_RAW_PRESCALE
++	 *
++	 * DebayerCpu normally obtains a smaller output by selecting a
++	 * centred window from the Bayer input. For SP7 HQ/Fast that
++	 * produced the unwanted digital zoom.
++	 *
++	 * Instead, create a small full-FOV Bayer representation first
++	 * and feed that through the normal DebayerCpu path.
++	 */
++	const bool sp7HqRawPrescale =
++		inputCfg.size == Size(3264, 1836) &&
++		outputCfg.size == Size(1920, 1080);
++
++	const bool sp7FastRawPrescale =
++		inputCfg.size == Size(1632, 918) &&
++		outputCfg.size == Size(1404, 792);
++
++	sp7RawPrescale_ =
++		(sp7HqRawPrescale || sp7FastRawPrescale) &&
++		(outputCfg.pixelFormat == formats::ABGR8888 ||
++		 outputCfg.pixelFormat == formats::XBGR8888) &&
++		inputConfig_.bpp == 16 &&
++		inputConfig_.patternSize == Size(2, 2);
++
++	if (sp7RawPrescale_) {
++		sp7RawPrescaleSize_ =
++			Size(outputCfg.size.width +
++			     2 * inputConfig_.patternSize.width,
++			     outputCfg.size.height);
++
++		sp7ProcessingInputStride_ =
++			(sp7RawPrescaleSize_.width * sizeof(uint16_t) + 7) & ~7U;
++
++		/*
++		 * SP7_RAW_PRESCALE_STRIDE_FIX
++		 *
++		 * All DebayerCpu internals, including shiftLinePointers(),
++		 * must advance through the prescaled Bayer image with 3848
++		 * bytes/line rather than the original 6528 bytes/line.
++		 */
++		inputConfig_.stride = sp7ProcessingInputStride_;
++
++		sp7RawPrescaleBuffer_.resize(
++			static_cast<size_t>(sp7ProcessingInputStride_) *
++			sp7RawPrescaleSize_.height);
++
++		sp7RawXMap_.resize(sp7RawPrescaleSize_.width);
++		sp7RawYMap_.resize(sp7RawPrescaleSize_.height);
++
++		/*
++		 * Preserve Bayer parity:
++		 *
++		 * destination even x/y -> source even x/y
++		 * destination odd  x/y -> source odd  x/y
++		 *
++		 * Therefore BGGR remains BGGR after the spatial reduction.
++		 */
++		auto mapSameParity =
++			[](unsigned int d,
++			   unsigned int dstCount,
++			   unsigned int srcCount) {
++				uint64_t num =
++					static_cast<uint64_t>(d) *
++					(srcCount - 1);
++
++				unsigned int s =
++					static_cast<unsigned int>(
++						(num + (dstCount - 1) / 2) /
++						(dstCount - 1));
++
++				if ((s & 1U) != (d & 1U)) {
++					if (s + 1 < srcCount)
++						++s;
++					else if (s > 0)
++						--s;
++				}
++
++				return s;
++			};
++
++		for (unsigned int x = 0;
++		     x < sp7RawPrescaleSize_.width; ++x)
++			sp7RawXMap_[x] =
++				mapSameParity(x,
++					      sp7RawPrescaleSize_.width,
++					      inputCfg.size.width);
++
++		for (unsigned int y = 0;
++		     y < sp7RawPrescaleSize_.height; ++y)
++			sp7RawYMap_[y] =
++				mapSameParity(y,
++					      sp7RawPrescaleSize_.height,
++					      inputCfg.size.height);
++
++		/*
++		 * Two pixels on each side are interpolation border.
++		 * The actual output is still exactly 1920x1080.
++		 */
++		window_.x = inputConfig_.patternSize.width;
++		window_.y = 0;
++		window_.width = outputCfg.size.width;
++		window_.height = outputCfg.size.height;
++
++		LOG(Debayer, Info)
++			<< "SP7 RAW prescale "
++			<< inputCfg.size.width << "x"
++			<< inputCfg.size.height
++			<< " -> "
++			<< sp7RawPrescaleSize_.width << "x"
++			<< sp7RawPrescaleSize_.height
++			<< " -> "
++			<< outputCfg.size.width << "x"
++			<< outputCfg.size.height
++			<< " stride "
++			<< sp7ProcessingInputStride_;
++	} else {
++		window_.x =
++			((inputCfg.size.width - outputCfg.size.width) / 2) &
++			~(inputConfig_.patternSize.width - 1);
++		window_.y =
++			((inputCfg.size.height - outputCfg.size.height) / 2) &
++			~(inputConfig_.patternSize.height - 1);
++		window_.width = outputCfg.size.width;
++		window_.height = outputCfg.size.height;
++
++		inputConfig_.stride = sp7SourceInputStride_;
++		sp7ProcessingInputStride_ = inputConfig_.stride;
++		sp7RawPrescaleSize_ = {};
++		sp7RawPrescaleBuffer_.clear();
++		sp7RawXMap_.clear();
++		sp7RawYMap_.clear();
++	}
+ 
+ 	/*
+ 	 * Set the stats window to the whole processed window. Its coordinates are
+@@ -842,7 +979,7 @@ void DebayerCpuThread::process(uint32_t frame, const uint8_t *src, uint8_t *dst)
+ 	Rectangle &window = debayer_->window_;
+ 
+ 	/* Adjust src to top left corner of the window */
+-	src += (window.y + yStart_) * debayer_->inputConfig_.stride +
++	src += (window.y + yStart_) * debayer_->sp7ProcessingInputStride_ +
+ 	       window.x * debayer_->inputConfig_.bpp / 8;
+ 	/* Adjust dst for yStart_ */
+ 	dst += yStart_ * debayer_->outputConfig_.stride;
+@@ -861,7 +998,7 @@ void DebayerCpuThread::process(uint32_t frame, const uint8_t *src, uint8_t *dst)
+ void DebayerCpuThread::process2(uint32_t frame, const uint8_t *src, uint8_t *dst)
+ {
+ 	unsigned int outputStride = debayer_->outputConfig_.stride;
+-	unsigned int inputStride = debayer_->inputConfig_.stride;
++	unsigned int inputStride = debayer_->sp7ProcessingInputStride_;
+ 	Rectangle &window = debayer_->window_;
+ 	unsigned int yEnd = yEnd_;
+ 	/* Holds [0] previous- [1] current- [2] next-line */
+@@ -927,7 +1064,7 @@ void DebayerCpuThread::process2(uint32_t frame, const uint8_t *src, uint8_t *dst
+ void DebayerCpuThread::process4(uint32_t frame, const uint8_t *src, uint8_t *dst)
+ {
+ 	unsigned int outputStride = debayer_->outputConfig_.stride;
+-	unsigned int inputStride = debayer_->inputConfig_.stride;
++	unsigned int inputStride = debayer_->sp7ProcessingInputStride_;
+ 
+ 	/*
+ 	 * This holds pointers to [0] 2-lines-up [1] 1-line-up [2] current-line
+@@ -1089,6 +1226,46 @@ void DebayerCpu::process(uint32_t frame, FrameBuffer *input, FrameBuffer *output
+ 		return;
+ 	}
+ 
++	const uint8_t *processingSrc = in.planes()[0].data();
++
++	/*
++	 * SP7_RAW_PRESCALE
++	 *
++	 * Input is unpacked 10-bit Bayer in 16-bit words
++	 * (3264 pixels * 2 bytes = 6528-byte input stride).
++	 *
++	 * Spatially reduce the Bayer image while preserving the
++	 * parity of every sampled coordinate.
++	 */
++	if (sp7RawPrescale_) {
++		const uint8_t *srcBase = in.planes()[0].data();
++		uint8_t *dstBase = sp7RawPrescaleBuffer_.data();
++
++		for (unsigned int dy = 0;
++		     dy < sp7RawPrescaleSize_.height; ++dy) {
++			const unsigned int sy = sp7RawYMap_[dy];
++
++			const uint16_t *srcRow =
++				reinterpret_cast<const uint16_t *>(
++					srcBase +
++					static_cast<size_t>(sy) *
++					sp7SourceInputStride_);
++
++			uint16_t *dstRow =
++				reinterpret_cast<uint16_t *>(
++					dstBase +
++					static_cast<size_t>(dy) *
++					sp7ProcessingInputStride_);
++
++			for (unsigned int dx = 0;
++			     dx < sp7RawPrescaleSize_.width; ++dx)
++				dstRow[dx] =
++					srcRow[sp7RawXMap_[dx]];
++		}
++
++		processingSrc = sp7RawPrescaleBuffer_.data();
++	}
++
+ 	stats_->startFrame(frame);
+ 
+ 	workPendingMutex_.lock();
+@@ -1098,7 +1275,7 @@ void DebayerCpu::process(uint32_t frame, FrameBuffer *input, FrameBuffer *output
+ 	for (auto &thread : threads_)
+ 		thread->invokeMethod(&DebayerCpuThread::process,
+ 				     ConnectionTypeQueued, frame,
+-				     in.planes()[0].data(), out.planes()[0].data());
++				     processingSrc, out.planes()[0].data());
+ 
+ 	{
+ 		MutexLocker locker(workPendingMutex_);
+@@ -1107,6 +1284,46 @@ void DebayerCpu::process(uint32_t frame, FrameBuffer *input, FrameBuffer *output
+ 		});
+ 	}
+ 
++	/*
++	 * SP7 CPU SoftISP: optional 180 degree output rotation.
++	 *
++	 * The Surface Pro 7 rear OV8865 is physically mounted rotated by
++	 * 180 degrees. The Simple pipeline currently doesn't apply the
++	 * requested CameraConfiguration orientation to the CPU SoftISP
++	 * output. Rotate the finished 32-bit RGB frame in place when the
++	 * SP7-specific environment switch is enabled.
++	 */
++	static const bool verticalFlip = []() {
++		const char *value = std::getenv("LIBCAMERA_SOFTISP_VFLIP");
++		return value && value[0] == '1';
++	}();
++
++	if (verticalFlip) {
++		uint8_t *data = out.planes()[0].data();
++		const unsigned int width = window_.width;
++		const unsigned int height = window_.height;
++		const unsigned int stride = outputConfig_.stride;
++		constexpr unsigned int bytesPerPixel = 4;
++
++		/*
++		 * Surface Pro 7 rear camera:
++		 * The image only needs a vertical flip. Swap complete scanlines
++		 * while leaving the horizontal pixel order untouched.
++		 */
++		if (data && stride == width * bytesPerPixel) {
++			for (unsigned int y = 0; y < height / 2; ++y) {
++				uint32_t *top =
++					reinterpret_cast<uint32_t *>(
++						data + y * stride);
++				uint32_t *bottom =
++					reinterpret_cast<uint32_t *>(
++						data + (height - 1 - y) * stride);
++
++				std::swap_ranges(top, top + width, bottom);
++			}
++		}
++	}
++
+ 	metadata.planes()[0].bytesused = out.planes()[0].size();
+ 
+ 	dmaSyncers.clear();
+diff --git a/src/libcamera/software_isp/debayer_cpu.h b/src/libcamera/software_isp/debayer_cpu.h
+index 5281c65cb..4e4c03263 100644
+--- a/src/libcamera/software_isp/debayer_cpu.h
++++ b/src/libcamera/software_isp/debayer_cpu.h
+@@ -154,12 +154,43 @@ private:
+ 	debayerFn debayer2_;
+ 	debayerFn debayer3_;
+ 	Rectangle window_;
++
++	/*
++	 * SP7_RAW_PRESCALE
++	 *
++	 * For 3264x1836 -> 1920x1080 on the Surface Pro 7, shrink
++	 * the unpacked RAW10 Bayer image before debayering.
++	 *
++	 * The temporary RAW image is 1924x1080:
++	 *   2 Bayer pixels border
++	 * + 1920 visible pixels
++	 * + 2 Bayer pixels border.
++	 */
++	bool sp7RawPrescale_ = false;
++
++	/*
++	 * SP7_RAW_PRESCALE_STRIDE_FIX
++	 *
++	 * source stride:
++	 *   original 3264-pixel RAW buffer = 6528 bytes
++	 *
++	 * processing stride:
++	 *   prescaled 1924-pixel RAW buffer = 3848 bytes
++	 */
++	unsigned int sp7SourceInputStride_ = 0;
++	unsigned int sp7ProcessingInputStride_ = 0;
++
++	Size sp7RawPrescaleSize_;
++	std::vector<uint8_t> sp7RawPrescaleBuffer_;
++	std::vector<unsigned int> sp7RawXMap_;
++	std::vector<unsigned int> sp7RawYMap_;
++
+ 	std::unique_ptr<SwStatsCpu> stats_;
+ 	unsigned int xShift_; /* Offset of 0/1 applied to window_.x */
+ 
+ 	static constexpr unsigned int kMinThreads = 1;
+ 	static constexpr unsigned int kMaxThreads = 8;
+-	static constexpr unsigned int kDefaultThreads = 2;
++	static constexpr unsigned int kDefaultThreads = 8;
+ 
+ 	unsigned int workPending_ LIBCAMERA_TSA_GUARDED_BY(workPendingMutex_);
+ 	Mutex workPendingMutex_;
+diff --git a/src/libcamera/software_isp/software_isp.cpp b/src/libcamera/software_isp/software_isp.cpp
+index c73a16ce0..a09593f31 100644
+--- a/src/libcamera/software_isp/software_isp.cpp
++++ b/src/libcamera/software_isp/software_isp.cpp
+@@ -80,6 +80,7 @@ LOG_DEFINE_CATEGORY(SoftwareIsp)
+  * handler
+  */
+ SoftwareIsp::SoftwareIsp(PipelineHandler *pipe, const CameraSensor *sensor,
++			 const ControlInfoMap &lensControls,
+ 			 ControlInfoMap *ipaControls)
+ 	: ispWorkerThread_("SWIspWorker"),
+ 	  dmaHeap_(DmaBufAllocator::DmaBufAllocatorFlag::CmaHeap |
+@@ -162,6 +163,7 @@ SoftwareIsp::SoftwareIsp(PipelineHandler *pipe, const CameraSensor *sensor,
+ 			 sharedParams_.fd(),
+ 			 sensorInfo,
+ 			 sensor->controls(),
++			 lensControls,
+ 			 ipaControls,
+ 			 &ccmEnabled_);
+ 	if (ret) {
+@@ -176,6 +178,7 @@ SoftwareIsp::SoftwareIsp(PipelineHandler *pipe, const CameraSensor *sensor,
+ 					    metadataReady.emit(frame, metadata);
+ 				    });
+ 	ipa_->setSensorControls.connect(this, &SoftwareIsp::setSensorCtrls);
++	ipa_->setLensControls.connect(this, &SoftwareIsp::setLensCtrls);
+ 
+ 	debayer_->moveToThread(&ispWorkerThread_);
+ }
+@@ -441,6 +444,11 @@ void SoftwareIsp::setSensorCtrls(const ControlList &sensorControls)
+ 	setSensorControls.emit(sensorControls);
+ }
+ 
++void SoftwareIsp::setLensCtrls(const ControlList &lensControls)
++{
++	setLensControls.emit(lensControls);
++}
++
+ void SoftwareIsp::statsReady(uint32_t frame, uint32_t bufferId)
+ {
+ 	ispStatsReady.emit(frame, bufferId);
+diff --git a/src/libcamera/software_isp/swstats_cpu.cpp b/src/libcamera/software_isp/swstats_cpu.cpp
+index 7fb77ce7d..d95e3f6d3 100644
+--- a/src/libcamera/software_isp/swstats_cpu.cpp
++++ b/src/libcamera/software_isp/swstats_cpu.cpp
+@@ -229,6 +229,16 @@ void SwStatsCpu::statsBGGR10Line0(const uint8_t *src[], SwIspStats &stats)
+ 	if (swapLines_)
+ 		std::swap(src0, src1);
+ 
++	/*
++	 * SP7 autofocus experiment:
++	 * Measure horizontal high-frequency detail on the averaged
++	 * green samples. Green is used because it has two samples in
++	 * every Bayer 2x2 block and dominates luminance information.
++	 */
++	uint64_t focusScore = 0;
++	uint16_t previousGreen = 0;
++	bool havePreviousGreen = false;
++
+ 	/* x += 4 sample every other 2x2 block */
+ 	for (unsigned int x = 0; x < window_.width; x += 4) {
+ 		b = src0[x];
+@@ -238,10 +248,20 @@ void SwStatsCpu::statsBGGR10Line0(const uint8_t *src[], SwIspStats &stats)
+ 
+ 		g = (g + g2) / 2;
+ 
++		if (havePreviousGreen)
++			focusScore += g > previousGreen
++				? g - previousGreen
++				: previousGreen - g;
++
++		previousGreen = g;
++		havePreviousGreen = true;
++
+ 		/* divide Y by 4 for 10 -> 8 bpp value */
+ 		SWSTATS_ACCUMULATE_LINE_STATS(4)
+ 	}
+ 
++	stats.focusScore += focusScore;
++
+ 	SWSTATS_FINISH_LINE_STATS()
+ }
+ 
+@@ -391,6 +411,7 @@ void SwStatsCpu::startFrame(uint32_t frame)
+ 
+ 	for (auto &s : stats_) {
+ 		s.sum_ = RGB<uint64_t>({ 0, 0, 0 });
++		s.focusScore = 0;
+ 		s.yHistogram.fill(0);
+ 	}
+ }
+@@ -408,9 +429,11 @@ void SwStatsCpu::finishFrame(uint32_t frame, uint32_t bufferId)
+ 
+ 	if (valid) {
+ 		sharedStats_->sum_ = RGB<uint64_t>({ 0, 0, 0 });
++		sharedStats_->focusScore = 0;
+ 		sharedStats_->yHistogram.fill(0);
+ 		for (const auto &s : stats_) {
+ 			sharedStats_->sum_ += s.sum_;
++			sharedStats_->focusScore += s.focusScore;
+ 			for (unsigned int j = 0; j < SwIspStats::kYHistogramSize; j++)
+ 				sharedStats_->yHistogram[j] += s.yHistogram[j];
+ 		}
+diff --git a/src/ipa/simple/data/ov8865.yaml b/src/ipa/simple/data/ov8865.yaml
+new file mode 100644
+index 000000000..f5b3b72d6
+--- /dev/null
++++ b/src/ipa/simple/data/ov8865.yaml
+@@ -0,0 +1,10 @@
++# SPDX-License-Identifier: CC0-1.0
++
++version: 1
++
++algorithms:
++  - BlackLevel:
++      blackLevel: 1024
++  - Awb:
++  - Adjust:
++  - Agc:

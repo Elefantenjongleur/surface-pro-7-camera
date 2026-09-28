@@ -1,0 +1,28 @@
+#!/usr/bin/env bash
+# SPDX-License-Identifier: GPL-2.0-or-later
+
+# Surface Pro 7:
+# libcamera must not enumerate the rear camera before the DW9719
+# lens subdevice is ready, otherwise autofocus is missing until
+# WirePlumber is restarted.
+
+for i in {1..80}; do
+    if [ -L /sys/bus/i2c/devices/i2c-INT347A:00-VCM/driver ]; then
+        for dev in /dev/v4l-subdev*; do
+            [ -e "$dev" ] || continue
+
+            if /usr/bin/v4l2-ctl \
+                -d "$dev" \
+                --list-ctrls 2>/dev/null \
+                | /usr/bin/grep -q focus_absolute; then
+                exit 0
+            fi
+        done
+    fi
+
+    sleep 0.25
+done
+
+# Do not prevent the entire desktop camera service from starting
+# if the lens is unavailable.
+exit 0

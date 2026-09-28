@@ -1,0 +1,26 @@
+[Unit]
+Description=SP7 rear camera on-demand controller
+
+Requires=sp7-camera-relay@standard.service
+Requires=sp7-camera-relay@hq.service
+Requires=sp7-camera-relay@fast.service
+
+After=sp7-camera-relay@standard.service
+After=sp7-camera-relay@hq.service
+After=sp7-camera-relay@fast.service
+After=pipewire.service
+After=wireplumber.service
+
+Wants=pipewire.service
+Wants=wireplumber.service
+
+[Service]
+Type=simple
+
+ExecStart=/usr/local/libexec/sp7-camera-controller
+
+Restart=always
+RestartSec=1
+
+[Install]
+WantedBy=default.target

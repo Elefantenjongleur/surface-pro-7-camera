@@ -1,0 +1,659 @@
+diff --git a/spa/plugins/libcamera/libcamera-device.cpp b/spa/plugins/libcamera/libcamera-device.cpp
+index 2d6532f..e127676 100644
+--- a/spa/plugins/libcamera/libcamera-device.cpp
++++ b/spa/plugins/libcamera/libcamera-device.cpp
+@@ -160,7 +160,101 @@ int emit_info(struct impl *impl, bool full)
+ 
+ 	spa_device_emit_info(&impl->hooks, &info);
+ 
+-	if (true) {
++	if (model.find("ov8865") != std::string::npos) {
++		/*
++		 * Surface Pro 7 rear camera profiles.
++		 *
++		 * For now all three nodes still use the same global
++		 * libcamera sensor mode. This first step only verifies
++		 * that PipeWire/WirePlumber can expose three logical
++		 * cameras backed by the same physical OV8865.
++		 */
++		static const struct {
++			uint32_t id;
++			const char *profile;
++			const char *description;
++		} sp7Profiles[] = {
++			{ 0, "hq",     "Surface Rear HQ" },
++			{ 1, "smooth", "Surface Rear Smooth" },
++			{ 2, "fast",   "Surface Rear Fast" },
++		};
++
++		for (const auto &profile : sp7Profiles) {
++			struct spa_dict_item nodeItems[64];
++			uint32_t nNodeItems = 0;
++
++			/*
++			 * Start with the normal libcamera device properties,
++			 * but replace properties that must be unique per
++			 * logical camera node.
++			 */
++			for (uint32_t i = 0;
++			     i < dict.n_items &&
++			     nNodeItems < SPA_N_ELEMENTS(nodeItems) - 5;
++			     ++i) {
++				const char *key = dict.items[i].key;
++
++				if (spa_streq(key, "object.path") ||
++				    spa_streq(key, "node.name") ||
++				    spa_streq(key, "node.description") ||
++				    spa_streq(key, SPA_KEY_API_LIBCAMERA_PATH) ||
++				    spa_streq(key, "api.libcamera.sp7.profile"))
++					continue;
++
++				nodeItems[nNodeItems++] = dict.items[i];
++			}
++
++			std::string objectPath =
++				"libcamera:" + impl->device_id + ":" +
++				profile.profile;
++
++			std::string nodeName =
++				"sp7.rear." + std::string(profile.profile);
++
++			/*
++			 * SP7_PROFILED_API_PATH
++			 *
++			 * api.libcamera.path is guaranteed to be passed to the
++			 * SPA source constructor. Encode the logical profile in it;
++			 * libcamera-source.cpp strips the suffix before looking up
++			 * the real physical camera.
++			 */
++			std::string profiledApiPath =
++				impl->device_id + "|sp7=" + profile.profile;
++
++			nodeItems[nNodeItems++] = {
++				"object.path", objectPath.c_str()
++			};
++			nodeItems[nNodeItems++] = {
++				"node.name", nodeName.c_str()
++			};
++			nodeItems[nNodeItems++] = {
++				"node.description", profile.description
++			};
++			nodeItems[nNodeItems++] = {
++				SPA_KEY_API_LIBCAMERA_PATH, profiledApiPath.c_str()
++			};
++			nodeItems[nNodeItems++] = {
++				"api.libcamera.sp7.profile", profile.profile
++			};
++
++			struct spa_dict nodeDict =
++				SPA_DICT_INIT(nodeItems, nNodeItems);
++
++			struct spa_device_object_info oinfo;
++
++			oinfo = SPA_DEVICE_OBJECT_INFO_INIT();
++			oinfo.type = SPA_TYPE_INTERFACE_Node;
++			oinfo.factory_name = SPA_NAME_API_LIBCAMERA_SOURCE;
++			oinfo.change_mask =
++				SPA_DEVICE_OBJECT_CHANGE_MASK_PROPS;
++			oinfo.props = &nodeDict;
++
++			spa_device_emit_object_info(&impl->hooks,
++						    profile.id,
++						    &oinfo);
++		}
++	} else {
+ 		struct spa_device_object_info oinfo;
+ 
+ 		oinfo = SPA_DEVICE_OBJECT_INFO_INIT();
+diff --git a/spa/plugins/libcamera/libcamera-source.cpp b/spa/plugins/libcamera/libcamera-source.cpp
+index 1eae218..d4b0660 100644
+--- a/spa/plugins/libcamera/libcamera-source.cpp
++++ b/spa/plugins/libcamera/libcamera-source.cpp
+@@ -125,6 +125,14 @@ struct impl {
+ 	struct spa_loop *data_loop;
+ 	struct spa_system *system;
+ 
++	/*
++	 * SP7_HQ_3260X1836
++	 *
++	 * HQ and Fast use the same 3264x1836 sensor mode, so the
++	 * SensorConfiguration alone cannot distinguish them.
++	 */
++	bool sp7HqProfile = false;
++
+ 	static constexpr uint64_t info_all =
+ 		SPA_NODE_CHANGE_MASK_FLAGS |
+ 		SPA_NODE_CHANGE_MASK_PROPS |
+@@ -243,6 +251,13 @@ int spa_libcamera_buffer_recycle(struct impl *impl, struct port *port, uint32_t
+ 	struct buffer *b = &port->buffers[buffer_id];
+ 	int res;
+ 
++	if (impl->sp7HqProfile)
++		spa_log_warn(impl->log,
++			     "SP7 HQ BUF RECYCLE_CALL id=%u outstanding=%u active=%u",
++			     buffer_id,
++			     SPA_FLAG_IS_SET(b->flags, BUFFER_FLAG_OUTSTANDING) ? 1u : 0u,
++			     impl->active ? 1u : 0u);
++
+ 	if (!SPA_FLAG_IS_SET(b->flags, BUFFER_FLAG_OUTSTANDING))
+ 		return 0;
+ 
+@@ -262,6 +277,11 @@ int spa_libcamera_buffer_recycle(struct impl *impl, struct port *port, uint32_t
+ 				buffer_id, spa_strerror(res));
+ 			return res == -EACCES ? -EBUSY : res;
+ 		}
++
++		if (impl->sp7HqProfile)
++			spa_log_warn(impl->log,
++				     "SP7 HQ BUF REQUEUE id=%u",
++				     buffer_id);
+ 	}
+ 	return 0;
+ }
+@@ -535,7 +555,52 @@ next_fmt:
+ 	SizeRange sizeRange;
+ 	Size frameSize;
+ 
+-	if (!sizes.empty() && port->size_index <= sizes.size()) {
++	/*
++	 * SP7_SMOOTH_ENUM_4_3
++	 *
++	 * Smooth uses the native 1632x1224 OV8865 binning mode.
++	 *
++	 * Do not advertise the generic size list to PipeWire/GStreamer.
++	 * Snapshot otherwise selects 1920x1080 before set_format(),
++	 * while the SP7 Smooth path later produces a 4:3 frame.
++	 *
++	 * For this diagnostic step, advertise exactly the same
++	 * 1600x1200 size that spa_libcamera_set_format() produces.
++	 */
++	const bool sp7SmoothEnum =
++		impl->config->sensorConfig &&
++		impl->config->sensorConfig->outputSize == Size(1632, 1224);
++
++	const bool sp7HqNativeEnum =
++		impl->sp7HqProfile &&
++		impl->config->sensorConfig &&
++		impl->config->sensorConfig->outputSize == Size(3264, 2448);
++
++	const bool sp7FastNativeEnum =
++		impl->config->sensorConfig &&
++		impl->config->sensorConfig->outputSize == Size(1632, 918);
++
++	if (sp7SmoothEnum || sp7HqNativeEnum || sp7FastNativeEnum) {
++		/*
++		 * One size per pixel format only.
++		 *
++		 * On the next size request advance to the next pixel format,
++		 * just like the normal enumeration code below.
++		 */
++		if (port->size_index > 0) {
++			port->size_index = 0;
++			port->fmt_index++;
++			goto next_fmt;
++		}
++
++		if (sp7SmoothEnum)
++			frameSize = Size(1628, 1224);
++		else if (sp7HqNativeEnum)
++			frameSize = Size(3260, 2448);
++		else
++			frameSize = Size(1404, 792);
++	}
++	else if (!sizes.empty() && port->size_index <= sizes.size()) {
+ 		if (port->size_index == 0) {
+ 			Size wanted = Size(640, 480);
+ 			int best = std::numeric_limits<int>::max();
+@@ -603,6 +668,23 @@ next_fmt:
+ 		spa_pod_builder_rectangle(&b, frameSize.width, frameSize.height);
+ 	}
+ 
++	/*
++	 * SP7_HQ_REAL_FRAMERATE
++	 *
++	 * The native OV8865 full-sensor mode runs at
++	 * 144000000 / (3888 * 2600) = 5000/351 fps.
++	 *
++	 * Advertise the actual HQ frame rate instead of leaving
++	 * negotiation to the consumer, which otherwise selects 30 fps.
++	 */
++	if (sp7HqNativeEnum) {
++		spa_pod_builder_prop(&b, SPA_FORMAT_VIDEO_framerate, 0);
++		spa_pod_builder_fraction(&b, 5000, 351);
++	} else if (sp7FastNativeEnum) {
++		spa_pod_builder_prop(&b, SPA_FORMAT_VIDEO_framerate, 0);
++		spa_pod_builder_fraction(&b, 108800000, 1813389);
++	}
++
+ 	if (streamConfig.colorSpace) {
+ 		auto colorimetry = color_space_to_colorimetry(*streamConfig.colorSpace);
+ 
+@@ -675,10 +757,96 @@ int spa_libcamera_set_format(struct impl *impl, struct port *port,
+ 	streamConfig.size.height = size->height;
+ 	streamConfig.bufferCount = 8;
+ 
++	/*
++	 * SP7_SMOOTH_FULL_FRAME
++	 *
++	 * The OV8865 smooth profile uses the native 1632x1224
++	 * binning sensor mode. The CPU SoftISP has already been
++	 * proven stable with a 1628x1224 ABGR output.
++	 *
++	 * Do not let a 16:9 request from Snapshot crop the
++	 * 4:3 sensor image down to 1628x1080.
++	 */
++	const bool sp7SmoothFullFrame =
++		impl->config->sensorConfig &&
++		impl->config->sensorConfig->outputSize == Size(1632, 1224) &&
++		format->media_subtype == SPA_MEDIA_SUBTYPE_raw;
++
++	const bool sp7HqNative =
++		impl->sp7HqProfile &&
++		impl->config->sensorConfig &&
++		impl->config->sensorConfig->outputSize == Size(3264, 2448) &&
++		format->media_subtype == SPA_MEDIA_SUBTYPE_raw;
++
++	const bool sp7FastNative =
++		impl->config->sensorConfig &&
++		impl->config->sensorConfig->outputSize == Size(1632, 918) &&
++		format->media_subtype == SPA_MEDIA_SUBTYPE_raw;
++
++	if (sp7SmoothFullFrame) {
++		streamConfig.size = Size(1628, 1224);
++
++		spa_log_info(impl->log,
++			     "SP7 Smooth: forcing processed output 1628x1224");
++	} else if (sp7HqNative) {
++		/*
++		 * SP7_HQ_3260X1836
++		 *
++		 * Keep the proven OV8865 3264x1836 RAW sensor mode
++		 * and expose the maximum directly debayered RGB frame.
++		 * No RAW prescale and no downscaling.
++		 */
++		streamConfig.size = Size(3260, 2448);
++
++		spa_log_info(impl->log,
++			     "SP7 HQ: native full-sensor output 3260x2448, no downscaling");
++	} else if (sp7FastNative) {
++		streamConfig.size = Size(1404, 792);
++
++		spa_log_info(impl->log,
++			     "SP7 Fast: native output 1404x792, no upscaling");
++	}
++
+ 	validation = impl->config->validate();
+ 	if (validation == CameraConfiguration::Invalid)
+ 		return -EINVAL;
+ 
++	/*
++	 * validate() is allowed to adjust the StreamConfiguration.
++	 *
++	 * PipeWire must advertise the actual validated size, not the
++	 * originally requested size. Otherwise current_format and the
++	 * actual libcamera buffers disagree about the image stride.
++	 */
++	size->width = streamConfig.size.width;
++	size->height = streamConfig.size.height;
++
++	/*
++	 * SP7_HQ_REAL_FRAMERATE
++	 *
++	 * Keep the negotiated PipeWire format consistent with the
++	 * native 3264x2448 OV8865 sensor timing.
++	 */
++	if (sp7HqNative) {
++		framerate->num = 5000;
++		framerate->denom = 351;
++
++		spa_log_info(impl->log,
++			     "SP7 HQ: reporting native framerate 5000/351 (%.6f fps)",
++			     5000.0 / 351.0);
++	} else if (sp7FastNative) {
++		framerate->num = 108800000;
++		framerate->denom = 1813389;
++
++		spa_log_info(impl->log,
++			     "SP7 Fast: reporting full-FOV framerate 108800000/1813389 (%.6f fps)",
++			     108800000.0 / 1813389.0);
++	}
++
++	spa_log_info(impl->log,
++		     "SP7 PipeWire validated output: %ux%u",
++		     size->width, size->height);
++
+ 	if (try_only)
+ 		return 0;
+ 
+@@ -1033,6 +1201,18 @@ void handle_completed_request(struct impl *impl, libcamera::Request *request)
+ 
+ 	const FrameMetadata &fmd = buffer->metadata();
+ 
++	if (impl->sp7HqProfile)
++		spa_log_warn(impl->log,
++			     "SP7 HQ BUF COMPLETE seq=%" PRIu32
++			     " ts=%" PRIu64
++			     " req=%" PRIu64 " id=%u io_status=%d io_buf=%u",
++			     fmd.sequence,
++			     fmd.timestamp,
++			     request_id,
++			     b->id,
++			     port->io ? port->io->status : -999,
++			     port->io ? port->io->buffer_id : SPA_ID_INVALID);
++
+ 	if (impl->clock) {
+ 		double target = (double)port->info.rate.num / port->info.rate.denom;
+ 		double corr;
+@@ -1100,6 +1280,18 @@ void handle_completed_request(struct impl *impl, libcamera::Request *request)
+ 		io->buffer_id = b->id;
+ 		io->status = SPA_STATUS_HAVE_DATA;
+ 		spa_log_trace(impl->log, "%p: now queued %" PRIu32, impl, b->id);
++
++		if (impl->sp7HqProfile)
++			spa_log_warn(impl->log,
++				     "SP7 HQ BUF DIRECT_PUBLISH seq=%" PRIu32
++				     " id=%u",
++				     fmd.sequence, b->id);
++	} else if (impl->sp7HqProfile) {
++		spa_log_warn(impl->log,
++			     "SP7 HQ BUF QUEUED_BEHIND seq=%" PRIu32
++			     " id=%u current=%u status=%d",
++			     fmd.sequence, b->id,
++			     io->buffer_id, io->status);
+ 	}
+ 
+ 	spa_node_call_ready(&impl->callbacks, SPA_STATUS_HAVE_DATA);
+@@ -1148,7 +1340,14 @@ const struct {
+ 	uint32_t spa_transform_value; /* horizontal mirroring then counter-clockwise rotation */
+ } orientation_map[] = {
+ 	{ Orientation::Rotate0, SPA_META_TRANSFORMATION_None },
+-	{ Orientation::Rotate0Mirror, SPA_META_TRANSFORMATION_Flipped },
++	/*
++	 * Surface Pro 7 OV8865 workaround:
++	 * Snapshot displays the rear camera mirrored when the libcamera
++	 * Rotate0Mirror orientation is exported as SPA Flipped metadata.
++	 * The pixel data is already in the desired orientation for this
++	 * camera path, so don't request an additional client-side flip.
++	 */
++	{ Orientation::Rotate0Mirror, SPA_META_TRANSFORMATION_None },
+ 	{ Orientation::Rotate90, SPA_META_TRANSFORMATION_270 },
+ 	{ Orientation::Rotate90Mirror, SPA_META_TRANSFORMATION_Flipped90 },
+ 	{ Orientation::Rotate180, SPA_META_TRANSFORMATION_180 },
+@@ -1215,7 +1414,9 @@ spa_libcamera_alloc_buffers(struct impl *impl, struct port *port,
+ 		if (b->videotransform) {
+ 			b->videotransform->transform =
+ 				libcamera_orientation_to_spa_transform_value(impl->config->orientation);
+-			spa_log_debug(impl->log, "Setting videotransform for buffer %u to %u",
++			spa_log_warn(impl->log,
++				"SP7 TEST: orientation=%d videotransform buffer %u=%u",
++				static_cast<int>(impl->config->orientation),
+ 				i, b->videotransform->transform);
+ 
+ 		}
+@@ -1581,8 +1782,19 @@ int impl_node_send_command(void *object, const struct spa_command *command)
+ 	spa_return_val_if_fail(impl != nullptr, -EINVAL);
+ 	spa_return_val_if_fail(command != nullptr, -EINVAL);
+ 
++	if (impl->sp7HqProfile)
++		spa_log_warn(impl->log,
++			     "SP7 HQ NODE_COMMAND id=%u active=%u current=%u n_buffers=%u",
++			     SPA_NODE_COMMAND_ID(command),
++			     impl->active ? 1u : 0u,
++			     GET_OUT_PORT(impl, 0)->current_format ? 1u : 0u,
++			     GET_OUT_PORT(impl, 0)->n_buffers);
++
+ 	switch (SPA_NODE_COMMAND_ID(command)) {
+ 	case SPA_NODE_COMMAND_Start:
++		if (impl->sp7HqProfile)
++			spa_log_warn(impl->log, "SP7 HQ NODE_START");
++
+ 	{
+ 		struct port *port = GET_OUT_PORT(impl, 0);
+ 
+@@ -1596,7 +1808,14 @@ int impl_node_send_command(void *object, const struct spa_command *command)
+ 		break;
+ 	}
+ 	case SPA_NODE_COMMAND_Pause:
++		if (impl->sp7HqProfile)
++			spa_log_warn(impl->log, "SP7 HQ NODE_PAUSE");
++		if ((res = spa_libcamera_stream_off(impl)) < 0)
++			return res;
++		break;
+ 	case SPA_NODE_COMMAND_Suspend:
++		if (impl->sp7HqProfile)
++			spa_log_warn(impl->log, "SP7 HQ NODE_SUSPEND");
+ 		if ((res = spa_libcamera_stream_off(impl)) < 0)
+ 			return res;
+ 		break;
+@@ -1833,6 +2052,15 @@ int port_set_format(struct impl *impl, struct port *port,
+ {
+ 	const bool try_only = SPA_FLAG_IS_SET(flags, SPA_NODE_PARAM_FLAG_TEST_ONLY);
+ 
++	if (impl->sp7HqProfile)
++		spa_log_warn(impl->log,
++			     "SP7 HQ FORMAT_CALL flags=0x%x try=%u param=%s active=%u current=%u n_buffers=%u",
++			     flags, try_only ? 1u : 0u,
++			     format ? "SET" : "NULL",
++			     impl->active ? 1u : 0u,
++			     port->current_format ? 1u : 0u,
++			     port->n_buffers);
++
+ 	if (!try_only) {
+ 		spa_libcamera_stream_off(impl);
+ 		spa_libcamera_clear_buffers(port);
+@@ -1879,10 +2107,31 @@ int port_set_format(struct impl *impl, struct port *port,
+ 			return -EINVAL;
+ 		}
+ 
++		if (impl->sp7HqProfile &&
++		    info.media_subtype == SPA_MEDIA_SUBTYPE_raw)
++			spa_log_warn(impl->log,
++				     "SP7 HQ FORMAT_PARSED try=%u fmt=%u size=%ux%u fps=%u/%u",
++				     try_only ? 1u : 0u,
++				     info.info.raw.format,
++				     info.info.raw.size.width,
++				     info.info.raw.size.height,
++				     info.info.raw.framerate.num,
++				     info.info.raw.framerate.denom);
++
+ 		res = spa_libcamera_set_format(impl, port, &info, try_only);
+ 		if (res < 0)
+ 			return res;
+ 
++		if (impl->sp7HqProfile &&
++		    info.media_subtype == SPA_MEDIA_SUBTYPE_raw)
++			spa_log_warn(impl->log,
++				     "SP7 HQ FORMAT_NORMALIZED try=%u size=%ux%u fps=%u/%u",
++				     try_only ? 1u : 0u,
++				     info.info.raw.size.width,
++				     info.info.raw.size.height,
++				     info.info.raw.framerate.num,
++				     info.info.raw.framerate.denom);
++
+ 		if (!try_only)
+ 			port->current_format = info;
+ 	}
+@@ -1947,7 +2196,23 @@ int impl_node_port_use_buffers(void *object,
+ 
+ 	port = GET_PORT(impl, direction, port_id);
+ 
++	if (impl->sp7HqProfile)
++		spa_log_warn(impl->log,
++			     "SP7 HQ USE_BUFFERS requested=%u old=%u flags=0x%x buffers=%s active=%u current=%u",
++			     n_buffers,
++			     port->n_buffers,
++			     flags,
++			     buffers ? "SET" : "NULL",
++			     impl->active ? 1u : 0u,
++			     port->current_format ? 1u : 0u);
++
+ 	if (port->n_buffers) {
++		if (impl->sp7HqProfile)
++			spa_log_warn(impl->log,
++				     "SP7 HQ USE_BUFFERS_STOP old=%u active=%u",
++				     port->n_buffers,
++				     impl->active ? 1u : 0u);
++
+ 		spa_libcamera_stream_off(impl);
+ 		if ((res = spa_libcamera_clear_buffers(port)) < 0)
+ 			return res;
+@@ -2009,6 +2274,11 @@ int impl_node_port_reuse_buffer(void *object,
+ 
+ 	spa_return_val_if_fail(buffer_id < port->n_buffers, -EINVAL);
+ 
++	if (impl->sp7HqProfile)
++		spa_log_warn(impl->log,
++			     "SP7 HQ BUF REUSE_CALLBACK id=%u",
++			     buffer_id);
++
+ 	res = spa_libcamera_buffer_recycle(impl, port, buffer_id);
+ 
+ 	return res;
+@@ -2056,7 +2326,16 @@ int impl_node_process(void *object)
+ 
+ 	spa_log_trace(impl->log, "%p: status %d", impl, io->status);
+ 
++	if (impl->sp7HqProfile)
++		spa_log_warn(impl->log,
++			     "SP7 HQ BUF PROCESS status=%d id=%u",
++			     io->status, io->buffer_id);
++
+ 	if (io->status == SPA_STATUS_HAVE_DATA) {
++		if (impl->sp7HqProfile)
++			spa_log_warn(impl->log,
++				     "SP7 HQ BUF PROCESS_HAVE_DATA id=%u",
++				     io->buffer_id);
+ 		return SPA_STATUS_HAVE_DATA;
+ 	}
+ 
+@@ -2080,6 +2359,11 @@ int impl_node_process(void *object)
+ 	io->buffer_id = b->id;
+ 	io->status = SPA_STATUS_HAVE_DATA;
+ 
++	if (impl->sp7HqProfile)
++		spa_log_warn(impl->log,
++			     "SP7 HQ BUF PROCESS_PUBLISH id=%u",
++			     b->id);
++
+ 	return SPA_STATUS_HAVE_DATA;
+ }
+ 
+@@ -2198,13 +2482,40 @@ impl_init(const struct spa_handle_factory *factory,
+ 		return res;
+ 	}
+ 
+-	const char *device_id = info
++	const char *device_path = info
+ 		? spa_dict_lookup(info, SPA_KEY_API_LIBCAMERA_PATH)
+ 		: nullptr;
+ 
+-	auto camera = device_id ? manager->get(device_id) : nullptr;
++	/*
++	 * SP7_PROFILED_API_PATH
++	 *
++	 * Logical Surface rear-camera nodes carry a suffix such as
++	 *   |sp7=hq
++	 *   |sp7=smooth
++	 *   |sp7=fast
++	 *
++	 * Strip it before asking libcamera for the physical camera and
++	 * retain it for the per-node SensorConfiguration below.
++	 */
++	std::string device_id = device_path ? device_path : "";
++	std::string sp7ProfileFromPath;
++
++	const std::string sp7Marker = "|sp7=";
++	const std::size_t sp7MarkerPos = device_id.rfind(sp7Marker);
++
++	if (sp7MarkerPos != std::string::npos) {
++		sp7ProfileFromPath =
++			device_id.substr(sp7MarkerPos + sp7Marker.size());
++		device_id.erase(sp7MarkerPos);
++	}
++
++	auto camera = !device_id.empty()
++		? manager->get(device_id)
++		: nullptr;
++
+ 	if (!camera) {
+-		spa_log_error(log, "unknown camera id: %s", device_id);
++		spa_log_error(log, "unknown camera id: %s",
++			      device_id.c_str());
+ 		return -ENOENT;
+ 	}
+ 
+@@ -2214,9 +2525,71 @@ impl_init(const struct spa_handle_factory *factory,
+ 		return -EINVAL;
+ 	}
+ 
+-	new (handle) impl(log, data_loop, system,
+-			  std::move(manager), std::move(camera),
+-			  std::move(config));
++	/*
++	 * SP7_PER_NODE_SENSOR_PROFILE
++	 *
++	 * Three logical PipeWire nodes share one physical OV8865.
++	 * Select the requested sensor size independently for each node.
++	 *
++	 * hq     -> 3264x2448
++	 * smooth -> 1632x1224
++	 * fast   -> 1632x918 sensor / 1404x792 output
++	 */
++	const char *sp7ProfileProp = info
++		? spa_dict_lookup(info, "api.libcamera.sp7.profile")
++		: nullptr;
++
++	/*
++	 * Prefer the profile transported through api.libcamera.path.
++	 * Keep the custom property as a fallback.
++	 */
++	std::string sp7ProfileStorage =
++		!sp7ProfileFromPath.empty()
++			? sp7ProfileFromPath
++			: (sp7ProfileProp ? sp7ProfileProp : "");
++
++	const char *sp7Profile =
++		sp7ProfileStorage.empty()
++			? nullptr
++			: sp7ProfileStorage.c_str();
++
++	if (sp7Profile) {
++		libcamera::SensorConfiguration sensorConfig;
++		sensorConfig.bitDepth = 10;
++
++		if (spa_streq(sp7Profile, "smooth")) {
++			sensorConfig.outputSize = libcamera::Size(1632, 1224);
++			config->sensorConfig = sensorConfig;
++
++			spa_log_info(log,
++				     "SP7 profile smooth: sensor 1632x1224");
++		} else if (spa_streq(sp7Profile, "hq")) {
++			sensorConfig.outputSize = libcamera::Size(3264, 2448);
++			config->sensorConfig = sensorConfig;
++
++			spa_log_info(log,
++				     "SP7 profile %s: sensor 3264x2448",
++				     sp7Profile);
++		} else if (spa_streq(sp7Profile, "fast")) {
++			sensorConfig.outputSize = libcamera::Size(1632, 918);
++			config->sensorConfig = sensorConfig;
++
++			spa_log_info(log,
++				     "SP7 profile %s: sensor 1632x918 full-FOV test",
++				     sp7Profile);
++		}
++	}
++
++	auto *instance = new (handle) impl(log, data_loop, system,
++					 std::move(manager), std::move(camera),
++					 std::move(config));
++
++	instance->sp7HqProfile =
++		sp7Profile && spa_streq(sp7Profile, "hq");
++
++	spa_log_info(log, "SP7 source profile: %s%s",
++		     sp7Profile ? sp7Profile : "none",
++		     instance->sp7HqProfile ? " [HQ native output]" : "");
+ 
+ 	return 0;
+ }

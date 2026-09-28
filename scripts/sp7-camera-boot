@@ -1,0 +1,142 @@
+#!/usr/bin/env bash
+# SPDX-License-Identifier: GPL-2.0-or-later
+
+modprobe dw9719
+
+set +e
+
+log()
+{
+    echo "sp7-camera-boot: $*"
+    logger -t sp7-camera-boot -- "$*" 2>/dev/null || true
+}
+
+KREL="$(uname -r)"
+
+log "Kernel: $KREL"
+
+# Nur auf einem linux-surface-Kernel tätig werden.
+case "$KREL" in
+    *surface*)
+        ;;
+    *)
+        log "Kein linux-surface-Kernel – Kamera-Loader wird übersprungen."
+        exit 0
+        ;;
+esac
+
+# Nicht ein zweites Mal initialisieren.
+if [ -e /dev/media0 ]; then
+    log "/dev/media0 existiert bereits – nichts zu tun."
+    exit 0
+fi
+
+log "Lade IPU4P kontrolliert."
+
+MODULES=(
+    ipu_bridge
+    intel_ipu4p_isys_csslib
+    intel_ipu4p_psys_csslib
+    intel_ipu4p
+    intel_ipu4p_psys
+)
+
+for module in "${MODULES[@]}"; do
+    log "modprobe $module"
+
+    modprobe "$module"
+    RC=$?
+
+    if [ "$RC" -ne 0 ]; then
+        log "FEHLER: modprobe $module -> $RC"
+        exit "$RC"
+    fi
+done
+
+# Der funktionierende Aufbau benötigt MMU1 dauerhaft eingeschaltet,
+# bevor ISYS geladen wird.
+MMU1="/sys/bus/intel-ipu4-bus/devices/intel-ipu4-mmu1/power/control"
+
+for i in {1..50}; do
+    [ -e "$MMU1" ] && break
+    sleep 0.1
+done
+
+if [ -e "$MMU1" ]; then
+    log "Setze intel-ipu4-mmu1 power/control auf on."
+    echo on > "$MMU1"
+else
+    log "WARNUNG: $MMU1 wurde nicht gefunden."
+fi
+
+log "modprobe intel_ipu4p_isys"
+
+modprobe intel_ipu4p_isys
+RC=$?
+
+if [ "$RC" -ne 0 ]; then
+    log "FEHLER: modprobe intel_ipu4p_isys -> $RC"
+    exit "$RC"
+fi
+
+udevadm settle --timeout=10 2>/dev/null || true
+
+# Auf den fertigen Media-Graph warten.
+for i in {1..100}; do
+    if [ -e /dev/media0 ]; then
+        VIDEOS="$(find /dev -maxdepth 1 -name 'video*' 2>/dev/null | wc -l)"
+        log "ERFOLG: /dev/media0 vorhanden, Video-Nodes: $VIDEOS"
+
+# BEGIN SP7 DW9719 READY WAIT
+#
+# The camera graph alone is not enough: autofocus requires the DW9719
+# VCM to be bound before userspace starts using libcamera.
+VCM="/sys/bus/i2c/devices/i2c-INT347A:00-VCM"
+
+# Give ACPI/I2C enumeration a moment to create the VCM device.
+for i in $(seq 1 40); do
+    [ -d "$VCM" ] && break
+    sleep 0.25
+done
+
+/usr/sbin/modprobe dw9719 2>/dev/null || \
+    /usr/bin/modprobe dw9719 2>/dev/null || true
+
+# Wait for automatic driver binding.
+for i in $(seq 1 40); do
+    [ -L "$VCM/driver" ] && break
+    sleep 0.25
+done
+
+# Kernel 6.19 can occasionally leave this ACPI-created I2C client
+# present but unbound. Bind it explicitly if necessary.
+if [ -d "$VCM" ] && \
+   [ ! -L "$VCM/driver" ] && \
+   [ -d /sys/bus/i2c/drivers/dw9719 ]; then
+
+    REALDEV="$(readlink -f "$VCM")"
+    BUSID="$(basename "$REALDEV")"
+
+    echo "$BUSID" > /sys/bus/i2c/drivers/dw9719/bind 2>/dev/null || true
+fi
+
+# Do not declare camera initialization complete until the lens driver
+# is actually attached.
+for i in $(seq 1 40); do
+    [ -L "$VCM/driver" ] && break
+    sleep 0.25
+done
+
+if [ ! -L "$VCM/driver" ]; then
+    echo "SP7 camera boot: DW9719 failed to bind" >&2
+fi
+# END SP7 DW9719 READY WAIT
+
+        exit 0
+    fi
+
+    sleep 0.1
+done
+
+log "FEHLER: /dev/media0 erschien nicht."
+exit 1

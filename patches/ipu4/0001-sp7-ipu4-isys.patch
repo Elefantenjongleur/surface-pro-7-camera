@@ -1,0 +1,511 @@
+diff --git a/linux-6.19.8/drivers/media/pci/intel/ipu-isys-queue.c b/linux-6.19.8/drivers/media/pci/intel/ipu-isys-queue.c
+index 86fbee2..cbbfae0 100644
+--- a/linux-6.19.8/drivers/media/pci/intel/ipu-isys-queue.c
++++ b/linux-6.19.8/drivers/media/pci/intel/ipu-isys-queue.c
+@@ -666,6 +666,29 @@ static int verify_stream_start(struct ipu_isys_pipeline *ip,
+ 
+ 	if (!ip->csi2 || !ip->external || ip->interlaced)
+ 		return 0;
++
++	/*
++	 * SP7_REAR_HQ_FAST_SKIP_VERIFY
++	 *
++	 * The Surface Pro 7 rear OV8865 can deliver usable frames while the
++	 * generic startup verifier sees transient CSI receiver errors during
++	 * mode transitions. HQ already needs this exception. Apply the same
++	 * diagnostic exception to the 1632x918 Fast sensor mode so a transient
++	 * startup error cannot tear down an otherwise started Fast stream.
++	 *
++	 * Keep Smooth and the front camera on the normal verifier/recovery path.
++	 */
++	if (ip->source == 3 &&
++	    ((ipu_isys_get_frame_width(pipe_av) == 3264 &&
++	      ipu_isys_get_frame_height(pipe_av) == 2448) ||
++	     (ipu_isys_get_frame_width(pipe_av) == 1632 &&
++	      ipu_isys_get_frame_height(pipe_av) == 918))) {
++		dev_info(dev,
++			 "SP7 rear %ux%u: skipping generic startup verifier\n",
++			 ipu_isys_get_frame_width(pipe_av),
++			 ipu_isys_get_frame_height(pipe_av));
++		return 0;
++	}
+ 	if (atomic_read(&ip->frames_done) != frames_done_before_start)
+ 		return 0;
+ 
+@@ -729,6 +752,24 @@ static int verify_stream_start(struct ipu_isys_pipeline *ip,
+ 				"CSI-2 startup errors 0x%x; retrying sensor bounce\n",
+ 				last_receiver_errors);
+ 		}
++
++		/*
++		 * SP7 rear fatal CSI startup
++		 *
++		 * Rear OV8865 is source 3 on CSI-2 receiver 0. A fatal
++		 * receiver state does not recover by repeatedly bouncing only
++		 * the sensor. Abort verification so the existing STREAMON
++		 * rollback fully stops and reinitialises the CSI receiver.
++		 * Keep the OV5693/front-camera bounce recovery unchanged.
++		 */
++		if (fatal_receiver_errors &&
++		    ip->source == 3 && ip->csi2->index == 0) {
++			dev_warn(dev,
++				 "SP7 rear fatal CSI startup 0x%x; requesting full stream reset\n",
++				 last_receiver_errors);
++			rval = -EIO;
++			break;
++		}
+ 		msleep(20);
+ 		rval = v4l2_subdev_call(esd, video, s_stream, 1);
+ 		if (rval) {
+@@ -1361,9 +1402,10 @@ static void stop_streaming(struct vb2_queue *q)
+ 	return_buffers(aq, VB2_BUF_STATE_ERROR);
+ }
+ 
+-static unsigned int
++static bool
+ get_sof_sequence_by_timestamp(struct ipu_isys_pipeline *ip,
+-			      struct ipu_fw_isys_resp_info_abi *info)
++			      struct ipu_fw_isys_resp_info_abi *info,
++			      unsigned int *sequence)
+ {
+ 	struct ipu_isys *isys =
+ 	    container_of(ip, struct ipu_isys_video, ip)->isys;
+@@ -1372,10 +1414,11 @@ get_sof_sequence_by_timestamp(struct ipu_isys_pipeline *ip,
+ 
+ 	for (i = 0; i < IPU_ISYS_MAX_PARALLEL_SOF; i++)
+ 		if (time == ip->seq[i].timestamp) {
++			*sequence = ip->seq[i].sequence;
+ 			dev_dbg(&isys->adev->dev,
+ 				"sof: using sequence number %u for timestamp 0x%16.16llx\n",
+-				ip->seq[i].sequence, time);
+-			return ip->seq[i].sequence;
++				*sequence, time);
++			return true;
+ 		}
+ 
+ 	dev_dbg(&isys->adev->dev, "SOF: looking for 0x%16.16llx\n", time);
+@@ -1385,7 +1428,8 @@ get_sof_sequence_by_timestamp(struct ipu_isys_pipeline *ip,
+ 			ip->seq[i].sequence, ip->seq[i].timestamp);
+ 	dev_dbg(&isys->adev->dev, "SOF sequence number not found\n");
+ 
+-	return 0;
++	*sequence = 0;
++	return false;
+ }
+ 
+ static u64 get_sof_ns_delta(struct ipu_isys_video *av,
+@@ -1394,12 +1438,24 @@ static u64 get_sof_ns_delta(struct ipu_isys_video *av,
+ 	struct ipu_bus_device *adev = to_ipu_bus_device(&av->isys->adev->dev);
+ 	struct ipu_device *isp = adev->isp;
+ 	u64 delta, tsc_now;
+-
+-	if (!ipu4_buttress_tsc_read(isp, &tsc_now))
+-		delta = tsc_now -
+-		    ((u64) info->timestamp[1] << 32 | info->timestamp[0]);
+-	else
++	u64 fw_ts = (u64)info->timestamp[1] << 32 | info->timestamp[0];
++
++	if (!ipu4_buttress_tsc_read(isp, &tsc_now)) {
++		delta = tsc_now - fw_ts;
++
++		if (av->ip.source == 3 &&
++		    ipu_isys_get_frame_width(av) == 3264 &&
++		    ipu_isys_get_frame_height(av) == 2448)
++			dev_warn_ratelimited(&av->isys->adev->dev,
++				"SP7 HQ TS raw: tsc_now=%llu fw_ts=%llu "
++				"relation=%s raw_delta=%llu ns_delta=%llu\n",
++				tsc_now, fw_ts,
++				tsc_now >= fw_ts ? "OK" : "UNDERFLOW",
++				delta,
++				ipu4_buttress_tsc_ticks_to_ns(delta));
++	} else {
+ 		delta = 0;
++	}
+ 
+ 	return ipu4_buttress_tsc_ticks_to_ns(delta);
+ }
+@@ -1418,9 +1474,44 @@ ipu_isys_buf_calc_sequence_time(struct ipu_isys_buffer *ib,
+ 	u32 sequence;
+ 
+ 	if (ip->has_sof) {
+-		ns = (wall_clock_ts_on) ? ktime_get_real_ns() : ktime_get_ns();
+-		ns -= get_sof_ns_delta(av, info);
+-		sequence = get_sof_sequence_by_timestamp(ip, info);
++		u64 base_ns = (wall_clock_ts_on) ?
++			      ktime_get_real_ns() : ktime_get_ns();
++		u64 sof_delta_ns = get_sof_ns_delta(av, info);
++		bool sp7_hq = ip->source == 3 &&
++			      ipu_isys_get_frame_width(av) == 3264 &&
++			      ipu_isys_get_frame_height(av) == 2448;
++		bool sof_found =
++			get_sof_sequence_by_timestamp(ip, info, &sequence);
++		bool sp7_hq_fallback = sp7_hq &&
++			(!sof_found || sof_delta_ns > 1000000000ULL);
++
++		if (sp7_hq_fallback) {
++			ns = base_ns;
++			sequence = atomic_read(&ip->sequence);
++			if (sequence)
++				sequence--;
++
++			dev_warn_ratelimited(&av->isys->adev->dev,
++				"SP7 HQ TS fallback: sof_found=%u delta_ns=%llu "
++				"seq=%u atomic_seq=%d fw_ts=%llu\n",
++				sof_found, sof_delta_ns, sequence,
++				atomic_read(&ip->sequence),
++				((u64)info->timestamp[1] << 32) |
++				info->timestamp[0]);
++		} else {
++			ns = base_ns - sof_delta_ns;
++		}
++
++		if (sp7_hq)
++			dev_warn_ratelimited(&av->isys->adev->dev,
++				"SP7 HQ TS result: base_ns=%llu delta_ns=%llu "
++				"result_ns=%llu seq=%u atomic_seq=%d "
++				"sof_found=%u fallback=%u fw_ts=%llu\n",
++				base_ns, sof_delta_ns, ns, sequence,
++				atomic_read(&ip->sequence), sof_found,
++				sp7_hq_fallback,
++				((u64)info->timestamp[1] << 32) |
++				info->timestamp[0]);
+ 	} else {
+ 		ns = ((wall_clock_ts_on) ? ktime_get_real_ns() :
+ 		      ktime_get_ns());
+diff --git a/linux-6.19.8/drivers/media/pci/intel/ipu-isys-video.c b/linux-6.19.8/drivers/media/pci/intel/ipu-isys-video.c
+index db29fea..bcc3284 100644
+--- a/linux-6.19.8/drivers/media/pci/intel/ipu-isys-video.c
++++ b/linux-6.19.8/drivers/media/pci/intel/ipu-isys-video.c
+@@ -39,6 +39,23 @@ static bool use_stream_stop;
+ module_param(use_stream_stop, bool, 0660);
+ MODULE_PARM_DESC(use_stream_stop, "Use STOP command if running in CSI capture mode");
+ 
++static bool sp7_reinit_hw_on_first_stream;
++module_param(sp7_reinit_hw_on_first_stream, bool, 0660);
++MODULE_PARM_DESC(sp7_reinit_hw_on_first_stream,
++                 "SP7 test: re-run ISYS hardware setup before first rear stream");
++
++static bool sp7_full_fw_recycle_on_first_stream;
++module_param(sp7_full_fw_recycle_on_first_stream, bool, 0660);
++MODULE_PARM_DESC(sp7_full_fw_recycle_on_first_stream,
++                 "SP7 test: fully recycle ISYS power and firmware before first rear stream");
++
++/*
++ * SP7 restart experiment:
++ * Set after a source-3 stream has been stopped.  Access is serialized by
++ * isys->stream_mutex through the normal stream start/stop paths.
++ */
++static bool sp7_rear_restart_needs_recycle;
++
+ static bool debug_capture_links;
+ module_param(debug_capture_links, bool, 0444);
+ MODULE_PARM_DESC(debug_capture_links,
+@@ -255,6 +272,150 @@ const struct ipu_isys_pixelformat ipu_isys_pfmts_packed[] = {
+ 	{}
+ };
+ 
++/*
++ * SP7 full firmware recycle experiment.
++ *
++ * WirePlumber may keep V4L2 file handles open indefinitely.  Therefore the
++ * normal last-close / first-open firmware lifecycle is not repeated between
++ * captures.  At a point where no firmware stream is open, reproduce that
++ * lifecycle explicitly while preserving the userspace file handles:
++ *
++ *   firmware close
++ *   -> real ISYS parent power cycle
++ *   -> firmware authentication
++ *   -> SPC / message-buffer setup
++ *   -> firmware init
++ *
++ * The existing ipu_isys_force_power_cycle() performs the actual
++ * d0i0 -> i3 -> d0i0 transition and causes the normal ISYS runtime-resume
++ * callback (including isys_setup_hw()) to run.
++ */
++static int sp7_full_fw_recycle(struct ipu_isys *isys)
++{
++	struct ipu_bus_device *adev = to_ipu_bus_device(&isys->adev->dev);
++	struct ipu_device *isp = adev->isp;
++	unsigned long flags;
++	bool no_streams;
++	int close_rval = 0;
++	int rval;
++	int retries = 3;
++
++	spin_lock_irqsave(&isys->lock, flags);
++	no_streams = isys->stream_opened == 0;
++	spin_unlock_irqrestore(&isys->lock, flags);
++
++	if (!no_streams)
++		return -EBUSY;
++
++	mutex_lock(&isys->mutex);
++
++	if (!isys->video_opened) {
++		mutex_unlock(&isys->mutex);
++		return -ENODEV;
++	}
++
++	dev_info(&isys->adev->dev,
++		 "SP7 full recycle: begin, video_opened=%u\n",
++		 isys->video_opened);
++
++	/*
++	 * If an earlier firmware lifecycle operation already requested a reset,
++	 * do not try to talk to that context again.  Otherwise close it exactly
++	 * as video_release() does on the normal last-close path.
++	 */
++	if (!isys->reset_needed) {
++		close_rval = ipu_fw_isys_close(isys);
++		if (close_rval)
++			dev_warn(&isys->adev->dev,
++				 "SP7 full recycle: FW close returned %d; power cycling anyway\n",
++				 close_rval);
++	} else {
++		dev_warn(&isys->adev->dev,
++			 "SP7 full recycle: reset already required; skipping FW close\n");
++	}
++
++	/*
++	 * Deliberately request the existing recovery power cycle even after a
++	 * clean FW close.  This experiment specifically tests whether the real
++	 * ISYS power transition cures the source-3 restart transient.
++	 */
++	isys->reset_needed = true;
++	mutex_unlock(&isys->mutex);
++
++	rval = ipu_isys_force_power_cycle(isys);
++	if (rval) {
++		dev_err(&isys->adev->dev,
++			"SP7 full recycle: power cycle failed: %d\n", rval);
++		return rval;
++	}
++
++	/*
++	 * Match video_open(): authenticate the firmware again after the real
++	 * power transition before rebuilding the ISYS firmware context.
++	 */
++	do {
++		rval = ipu_buttress_authenticate(isp);
++		if (!rval)
++			break;
++
++		dev_warn(&isys->adev->dev,
++			 "SP7 full recycle: FW authentication failed, retrying (%d attempts left)\n",
++			 retries);
++		usleep_range(1000, 2000);
++	} while (retries-- > 0);
++
++	if (rval) {
++		mutex_lock(&isys->mutex);
++		isys->reset_needed = true;
++		mutex_unlock(&isys->mutex);
++
++		dev_err(&isys->adev->dev,
++			"SP7 full recycle: FW authentication failed: %d\n",
++			rval);
++		return rval;
++	}
++
++	mutex_lock(&isys->mutex);
++
++	ipu_configure_spc(isp,
++			  &isys->pdata->ipdata->hw_variant,
++			  IPU_CPD_PKG_DIR_ISYS_SERVER_IDX,
++			  isys->pdata->base, isys->pkg_dir,
++			  isys->pkg_dir_dma_addr);
++
++	ipu_cleanup_fw_msg_bufs(isys);
++
++	/*
++	 * A successful ipu_fw_isys_close() already cleared fwcom.  If close
++	 * timed out, the power cycle made the old hardware context irrelevant;
++	 * discard the remaining software context exactly as video_open() does
++	 * after recovery.
++	 */
++	if (isys->fwcom) {
++		dev_warn(&isys->adev->dev,
++			 "SP7 full recycle: cleaning stale FW context after power cycle\n");
++		ipu_fw_isys_cleanup(isys);
++	}
++
++	rval = ipu_fw_isys_init(isys, num_stream_support);
++	if (rval < 0) {
++		isys->reset_needed = true;
++		mutex_unlock(&isys->mutex);
++
++		dev_err(&isys->adev->dev,
++			"SP7 full recycle: FW re-init failed: %d\n",
++			rval);
++		return rval;
++	}
++
++	mutex_unlock(&isys->mutex);
++
++	dev_info(&isys->adev->dev,
++		 "SP7 full recycle: FW context rebuilt successfully\n");
++
++	return 0;
++}
++
+ static int video_open(struct file *file)
+ {
+ 	struct ipu_isys_video *av = video_drvdata(file);
+@@ -1931,6 +2092,10 @@ stop_streaming_firmware(struct ipu_isys_video *av)
+ 	if (use_stream_stop)
+ 		send_type = IPU_FW_ISYS_SEND_TYPE_STREAM_STOP;
+ 
++	dev_info(dev,
++		 "IRTRACE fw stop request source=%u handle=%d send_type=%u vc=%u stream_id=%u\n",
++		 ip->source, ip->stream_handle, send_type, ip->vc, ip->stream_id);
++
+ 	rval = ipu_fw_isys_simple_cmd(av->isys, ip->stream_handle,
+ 				      send_type);
+ 
+@@ -1957,7 +2122,9 @@ stop_streaming_firmware(struct ipu_isys_video *av)
+ 		mark_stream_reset_needed(av);
+ 		return IPU_ISYS_STOP_STREAMING_FAILED;
+ 	} else {
+-		dev_dbg(dev, "stop stream: complete\n");
++		dev_info(dev,
++			 "IRTRACE fw stop complete source=%u handle=%d send_type=%u error=%d\n",
++			 ip->source, ip->stream_handle, send_type, ip->error);
+ 	}
+ 
+ 	return IPU_ISYS_STOP_STREAMING_SUCCESS;
+@@ -1980,6 +2147,10 @@ static int close_streaming_firmware(struct ipu_isys_video *av)
+ 
+ 	reinit_completion(&ip->stream_close_completion);
+ 
++	dev_info(dev,
++		 "IRTRACE fw close request source=%u handle=%d vc=%u stream_id=%u\n",
++		 ip->source, ip->stream_handle, ip->vc, ip->stream_id);
++
+ 	rval = ipu_fw_isys_simple_cmd(av->isys, ip->stream_handle,
+ 				      IPU_FW_ISYS_SEND_TYPE_STREAM_CLOSE);
+ 	if (rval < 0) {
+@@ -2002,7 +2173,9 @@ static int close_streaming_firmware(struct ipu_isys_video *av)
+ 		close_failed = true;
+ 		dev_err(dev, "stream close error: %d\n", ip->error);
+ 	} else {
+-		dev_dbg(dev, "close stream: complete\n");
++		dev_info(dev,
++			 "IRTRACE fw close complete source=%u handle=%d error=%d\n",
++			 ip->source, ip->stream_handle, ip->error);
+ 	}
+ 
+ out_release_stream:
+@@ -2275,6 +2448,46 @@ int ipu_isys_video_set_streaming(struct ipu_isys_video *av,
+ 	}
+ 	esd = media_entity_to_v4l2_subdev(ip->external->entity);
+ 
++	/*
++	 * SP7 restart experiments.
++	 *
++	 * Both experiments are restricted to the rear OV8865 path (firmware
++	 * source 3) and to a transition where no firmware stream is open.
++	 *
++	 * full_fw_recycle takes precedence if both parameters are enabled.
++	 */
++	if (state && ip->source == 3 &&
++	    (sp7_full_fw_recycle_on_first_stream ||
++	     sp7_reinit_hw_on_first_stream)) {
++		unsigned long flags;
++		bool first_stream;
++
++		spin_lock_irqsave(&av->isys->lock, flags);
++		first_stream = av->isys->stream_opened == 0;
++		spin_unlock_irqrestore(&av->isys->lock, flags);
++
++		if (first_stream && sp7_full_fw_recycle_on_first_stream &&
++		    sp7_rear_restart_needs_recycle) {
++			dev_info(dev,
++				 "SP7 restart recycle: requested before source-3 restart\n");
++
++			rval = sp7_full_fw_recycle(av->isys);
++			if (rval)
++				return rval;
++
++			sp7_rear_restart_needs_recycle = false;
++		} else if (first_stream &&
++			   sp7_full_fw_recycle_on_first_stream) {
++			dev_info(dev,
++				 "SP7 restart recycle: first source-3 stream; no recycle needed\n");
++		} else if (first_stream &&
++			   sp7_reinit_hw_on_first_stream) {
++			dev_info(dev,
++				 "SP7 restart test: re-running isys_setup_hw before source-3 stream\n");
++			isys_setup_hw(av->isys);
++		}
++	}
++
+ 	if (state) {
+ 		rval = media_graph_walk_init(&ip->graph, mdev);
+ 		if (rval)
+@@ -2293,7 +2506,20 @@ int ipu_isys_video_set_streaming(struct ipu_isys_video *av,
+ 		}
+ 
+ 		/* stop external sub-device now. */
++		dev_info(dev,
++			 "IRTRACE external sensor stop begin source=%u handle=%d stream_count=%u remote_streams=%u\n",
++			 ip->source, ip->stream_handle,
++			 ip->csi2 ? ip->csi2->stream_count : 0,
++			 ip->csi2 ? ip->csi2->remote_streams : 0);
++
+ 		rval = stop_external_sensor(dev, ip, esd);
++
++		dev_info(dev,
++			 "IRTRACE external sensor stop end source=%u handle=%d rval=%d stream_count=%u remote_streams=%u\n",
++			 ip->source, ip->stream_handle, rval,
++			 ip->csi2 ? ip->csi2->stream_count : 0,
++			 ip->csi2 ? ip->csi2->remote_streams : 0);
++
+ 		if (rval && rval != -ENOIOCTLCMD && !cleanup_rval)
+ 			cleanup_rval = rval;
+ 	}
+@@ -2421,6 +2647,12 @@ int ipu_isys_video_set_streaming(struct ipu_isys_video *av,
+ 		media_graph_walk_cleanup(&ip->graph);
+ 	av->streaming = state;
+ 
++	if (!state && ip->source == 3) {
++		sp7_rear_restart_needs_recycle = true;
++		dev_info(dev,
++			 "SP7 restart recycle: source-3 stopped; next start requires recycle\n");
++	}
++
+ 	return state ? 0 : cleanup_rval;
+ 
+ out_media_entity_stop_streaming_firmware:
+diff --git a/linux-6.19.8/drivers/media/pci/intel/ipu-isys.c b/linux-6.19.8/drivers/media/pci/intel/ipu-isys.c
+index e69e252..ffb40fc 100644
+--- a/linux-6.19.8/drivers/media/pci/intel/ipu-isys.c
++++ b/linux-6.19.8/drivers/media/pci/intel/ipu-isys.c
+@@ -1271,6 +1271,10 @@ int isys_isr_one(struct ipu_bus_device *adev)
+ 		complete(&pipe->stream_open_completion);
+ 		break;
+ 	case IPU_FW_ISYS_RESP_TYPE_STREAM_CLOSE_ACK:
++		dev_info(&adev->dev,
++			 "IRTRACE fw close ACK source=%u handle=%u error=%d\n",
++			 pipe->source, resp->stream_handle,
++			 resp->error_info.error);
+ 		complete(&pipe->stream_close_completion);
+ 		break;
+ 	case IPU_FW_ISYS_RESP_TYPE_STREAM_START_ACK:
+@@ -1281,9 +1285,17 @@ int isys_isr_one(struct ipu_bus_device *adev)
+ 		complete(&pipe->stream_start_completion);
+ 		break;
+ 	case IPU_FW_ISYS_RESP_TYPE_STREAM_STOP_ACK:
++		dev_info(&adev->dev,
++			 "IRTRACE fw STOP ACK source=%u handle=%u error=%d\n",
++			 pipe->source, resp->stream_handle,
++			 resp->error_info.error);
+ 		complete(&pipe->stream_stop_completion);
+ 		break;
+ 	case IPU_FW_ISYS_RESP_TYPE_STREAM_FLUSH_ACK:
++		dev_info(&adev->dev,
++			 "IRTRACE fw FLUSH ACK source=%u handle=%u error=%d\n",
++			 pipe->source, resp->stream_handle,
++			 resp->error_info.error);
+ 		complete(&pipe->stream_stop_completion);
+ 		break;
+ 	case IPU_FW_ISYS_RESP_TYPE_PIN_DATA_READY:

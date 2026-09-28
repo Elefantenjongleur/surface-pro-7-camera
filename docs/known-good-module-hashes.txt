@@ -1,0 +1,14 @@
+Known-good module hashes
+========================
+
+System: 6.19.8-3.surface.fc43.x86_64
+
+9147680207bfc959335bc7d3877dc44d96184b36f70706d4a81e97c90c012f31  /lib/modules/6.19.8-3.surface.fc43.x86_64/updates/extra/ov8865.ko
+5fab5f56d0dbd9a69bef158bbac65d899bee964571d80f78e1d4c25d61e2283d  /lib/modules/6.19.8-3.surface.fc43.x86_64/updates/extra/dw9719.ko
+75570a1b34f311aae3aead93c2c51bcdab0379d3b7e445437650e3208621cbda  /lib/modules/6.19.8-3.surface.fc43.x86_64/updates/extra/ipu-bridge.ko
+f27dc570d0ff7b5822b0a791064c392e7c41aade585b022d8f973246f4d62dcd  /lib/modules/6.19.8-3.surface.fc43.x86_64/updates/extra/intel-ipu4p-isys-csslib.ko
+bda748f1da835ff2671a5f255b6942bf3a3a72a6ac8a07430cd063eab0bdacbd  /lib/modules/6.19.8-3.surface.fc43.x86_64/updates/extra/intel-ipu4p-psys-csslib.ko
+d79f1bc1e0e07c29dc427ca85bdf0b5850d7b7f791d84b68323fd98c0a440f2f  /lib/modules/6.19.8-3.surface.fc43.x86_64/updates/extra/intel-ipu4p.ko
+c6915200b56eab5e4bdd4b1d5c924da39ec7062e26913660e96fb663ff2e177e  /lib/modules/6.19.8-3.surface.fc43.x86_64/updates/extra/intel-ipu4p-psys.ko
+17078eb08fc2ed9b9744924f74264bdea50fe18249b45112dda2c6f25889410f  /lib/modules/6.19.8-3.surface.fc43.x86_64/updates/extra/intel-ipu4p-isys.ko
+977894b3e527af2424d00747223a83729d428e4446e7af5bcaa85ffd69c9650a  /lib/modules/6.19.8-3.surface.fc43.x86_64/updates/extra/v4l2loopback.ko

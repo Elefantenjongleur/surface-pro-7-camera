@@ -1,0 +1,48 @@
+SP7 Camera source bases
+=======================
+
+Linux:
+  repository: https://git.kernel.org/pub/scm/linux/kernel/git/stable/linux.git
+  tag: v6.19.8
+  commit: 86818b2e7d9c22225b15f2ae91d3f35c4a07dfd9
+
+IPU4:
+  repository: https://github.com/georgemihaila/sp7-ipu4-camera.git
+  commit: aa0043f3649c3bff9247d5f99de5d164c3cdcc75
+
+libcamera:
+  repository: https://gitlab.freedesktop.org/camera/libcamera.git
+  commit: 191e202178f02430b5942397c70d215cdd2056fa
+
+v4l2loopback:
+  repository: https://github.com/v4l2loopback/v4l2loopback.git
+  tag: v0.15.4
+  commit: 0f9ee86760b7f2bea174b7e3e7a1d38845da0ab4
+
+Tested system:
+  device: Microsoft Surface Pro 7
+  distribution: Fedora Workstation 43
+  kernel: 6.19.8-3.surface.fc43.x86_64
+  architecture: x86_64
+
+v4l2loopback source status:
+  v4l2loopback v0.15.4 is used unmodified.
+  CLIENT_USAGE is an upstream feature of v0.15.4.
+  No local v4l2loopback source patch is required.
+
+PipeWire:
+  upstream: https://gitlab.freedesktop.org/pipewire/pipewire.git
+  commit: 255541eac34370e312f0c5c8c18e46dc1911352f
+  describe: 1.4.11
+  local release delta:
+    patches/pipewire/0001-sp7-libcamera-profiles.patch
+  note:
+    Only the libcamera SPA changes are part of the SP7 release.
+    The local gstpipewiresrc.c diagnostic force-copy experiment is excluded.
+
+IPU4 firmware:
+  repository: ruslanbay/ipu4-drivers
+  commit: 4ea36123f12e8eafe4f12017614e7b642feb5430
+  file: firmware/ipu4-20191030.bin
+  installed as: /usr/lib/firmware/ipu4p_cpd.bin
+  sha256: ff2c36cc81a5c726508b22970c2e2538ff06107dc5a72c93401403c227e5157f
