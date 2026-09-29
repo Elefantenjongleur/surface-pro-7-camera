@@ -1,0 +1,22 @@
+#!/usr/bin/env bash
+
+# Surface Pro 7 / Realtek ALC274:
+# The internal microphone may start with +30 dB Internal Mic Boost,
+# causing severe clipping. Keep the hardware boost at 0 dB.
+#
+# This helper is deliberately non-fatal on systems where the expected
+# ALSA card or mixer control does not exist.
+
+CARD="PCH"
+CONTROL="Internal Mic Boost"
+
+if ! command -v amixer >/dev/null 2>&1; then
+    exit 0
+fi
+
+if ! amixer -c "$CARD" scontrols 2>/dev/null |
+     grep -Fq "Simple mixer control '$CONTROL',0"; then
+    exit 0
+fi
+
+amixer -q -c "$CARD" set "$CONTROL" 0

@@ -1101,6 +1101,20 @@ install \
 systemctl --user daemon-reload
 systemctl --user enable sp7-camera-controller.service
 
+# Surface Pro 7 ALC274 internal microphone gain fix.
+# Some systems expose Internal Mic Boost at +30 dB, which clips badly.
+# The helper is non-fatal if the expected ALSA card/control is absent.
+sudo install -Dm755 \
+    "$ROOT/src/sp7-audio-fix" \
+    /usr/local/libexec/sp7-audio-fix
+
+install -Dm644 \
+    "$ROOT/systemd/user/sp7-audio-fix.service" \
+    "$USER_SYSTEMD/sp7-audio-fix.service"
+
+systemctl --user daemon-reload
+systemctl --user enable --now sp7-audio-fix.service
+
 # -------------------------------------------------------------------------
 # Final static verification
 # -------------------------------------------------------------------------

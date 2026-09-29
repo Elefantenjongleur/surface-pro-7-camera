@@ -166,6 +166,36 @@ Signal may mirror the local preview because the v4l2loopback devices
 appear as generic webcams. The camera pipeline itself does not apply a
 horizontal flip.
 
+## Internal microphone
+
+The Surface Pro 7 uses a Realtek ALC274 audio codec. On the tested Fedora 43
+system, the internal microphone was initialized with `Internal Mic Boost` at
+`+30 dB`, causing severe clipping and distorted voice recordings even though
+applications reported an input level of 100%.
+
+The installer includes `sp7-audio-fix.service`, which sets only the ALC274
+`Internal Mic Boost` control to `0 dB` through the stable ALSA card ID `PCH`.
+The normal `Capture` and `Digital` gains are left untouched.
+
+The helper is deliberately non-fatal if the expected ALSA card or mixer
+control is not present.
+
+The tagged camera reference
+`sp7-camera-five-profile-final-2026-09-29` predates this audio fix and remains
+unchanged.
+
+### GNOME Snapshot video recording
+
+Camera preview, still photos and camera switching work correctly in GNOME
+Snapshot. Video recording is visibly strongly compressed, particularly with
+the high-resolution camera profiles.
+
+Current GNOME Snapshot/Aperture code uses a default video encoder bitrate of
+2048 kbit/s. This is low for the resolutions provided by this project and
+provides a plausible explanation for the visible compression. Applications
+using the V4L2 devices directly are not limited to Snapshot's recording
+bitrate.
+
 ## Release policy
 
 Version 0.1.x deliberately preserves the code that was tested on the
