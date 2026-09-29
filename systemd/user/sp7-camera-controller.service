@@ -1,13 +1,17 @@
 [Unit]
-Description=SP7 rear camera on-demand controller
+Description=SP7 camera on-demand controller
 
 Requires=sp7-camera-relay@standard.service
 Requires=sp7-camera-relay@hq.service
 Requires=sp7-camera-relay@fast.service
+Requires=sp7-camera-relay@front-standard.service
+Requires=sp7-camera-relay@front-hq.service
 
 After=sp7-camera-relay@standard.service
 After=sp7-camera-relay@hq.service
 After=sp7-camera-relay@fast.service
+After=sp7-camera-relay@front-standard.service
+After=sp7-camera-relay@front-hq.service
 After=pipewire.service
 After=wireplumber.service
 

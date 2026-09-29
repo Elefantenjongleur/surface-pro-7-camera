@@ -1019,7 +1019,7 @@ sudo install \
     "$ROOT/scripts/sp7-camera-boot" \
     /usr/local/sbin/sp7-camera-boot
 
-for profile in standard hq fast; do
+for profile in standard hq fast front-standard front-hq; do
     sudo install \
         -D \
         -m 0644 \

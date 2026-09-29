@@ -14,6 +14,8 @@
 #define V4L2_EVENT_PRI_CLIENT_USAGE \
     (V4L2_EVENT_PRIVATE_START + 0x08E00000 + 1)
 
+#define CAMERA_COUNT 5
+
 static volatile sig_atomic_t running = 1;
 
 struct camera {
@@ -41,13 +43,15 @@ static long long now_ms(void)
 
 int main(void)
 {
-    struct camera cams[3] = {
-        { "/dev/video80", "Rear Standard", -1, 0 },
-        { "/dev/video81", "Rear HQ",       -1, 0 },
-        { "/dev/video82", "Rear Fast",     -1, 0 },
+    struct camera cams[CAMERA_COUNT] = {
+        { "/dev/video80", "Rear Standard",  -1, 0 },
+        { "/dev/video81", "Rear HQ",        -1, 0 },
+        { "/dev/video82", "Rear Fast",      -1, 0 },
+        { "/dev/video83", "Front Standard", -1, 0 },
+        { "/dev/video84", "Front HQ",       -1, 0 },
     };
 
-    struct pollfd pfds[3];
+    struct pollfd pfds[CAMERA_COUNT];
     struct v4l2_event_subscription sub;
     int i;
 
@@ -58,7 +62,7 @@ int main(void)
     sub.type = V4L2_EVENT_PRI_CLIENT_USAGE;
     sub.flags = V4L2_EVENT_SUB_FL_SEND_INITIAL;
 
-    for (i = 0; i < 3; i++) {
+    for (i = 0; i < CAMERA_COUNT; i++) {
         cams[i].fd = open(cams[i].dev, O_RDWR | O_NONBLOCK);
 
         if (cams[i].fd < 0) {
@@ -80,7 +84,7 @@ int main(void)
     fflush(stdout);
 
     while (running) {
-        int rc = poll(pfds, 3, 1000);
+        int rc = poll(pfds, CAMERA_COUNT, 1000);
 
         if (rc < 0) {
             if (errno == EINTR)
@@ -93,7 +97,7 @@ int main(void)
         if (rc == 0)
             continue;
 
-        for (i = 0; i < 3; i++) {
+        for (i = 0; i < CAMERA_COUNT; i++) {
             if (pfds[i].revents & POLLPRI) {
                 struct v4l2_event ev;
 
@@ -104,14 +108,17 @@ int main(void)
                     cams[i].count = count;
 
                     printf(
-                        "%lld ms | %-13s | count=%u"
-                        " | STATE: Standard=%u HQ=%u Fast=%u\n",
+                        "%lld ms | %-14s | count=%u"
+                        " | STATE: Standard=%u HQ=%u Fast=%u"
+                        " FrontStandard=%u FrontHQ=%u\n",
                         now_ms(),
                         cams[i].name,
                         count,
                         cams[0].count,
                         cams[1].count,
-                        cams[2].count
+                        cams[2].count,
+                        cams[3].count,
+                        cams[4].count
                     );
 
                     fflush(stdout);
@@ -120,7 +127,7 @@ int main(void)
         }
     }
 
-    for (i = 0; i < 3; i++)
+    for (i = 0; i < CAMERA_COUNT; i++)
         if (cams[i].fd >= 0)
             close(cams[i].fd);
 

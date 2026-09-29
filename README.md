@@ -1,7 +1,7 @@
-# Surface Pro 7 Rear Camera for Linux
+# Surface Pro 7 Camera for Linux
 
-Experimental camera support for the rear OV8865 camera of the
-Microsoft Surface Pro 7.
+Experimental camera support for the rear OV8865 and front OV5693 RGB
+cameras of the Microsoft Surface Pro 7.
 
 This repository contains the complete known-good source delta and
 userspace integration used on a real Surface Pro 7 running Fedora 43.
@@ -15,6 +15,7 @@ Tested working:
 - linux-surface kernel 6.19.8-3
 - rear OV8865 camera
 - DW9719 focus actuator
+- front OV5693 RGB camera
 - Intel IPU4P
 - libcamera SimplePipeline + CPU SoftISP
 - PipeWire / WirePlumber
@@ -26,29 +27,34 @@ driver.
 
 ## Camera profiles
 
-Three rear-camera profiles are provided:
+Five camera profiles are provided:
 
-| Profile | Output | Approx. frame rate | Intended use |
+| Profile | Output | Approx. / nominal rate | Intended use |
 | --- | --- | ---: | --- |
-| Rear Standard | 1628x1224 | 30 fps | Default |
-| Rear HQ | 3260x2448 | 14.25 fps | Maximum resolution |
-| Rear Fast | 1404x792 | 60 fps | High frame rate |
+| Rear Standard | 1628x1224 | 30 fps | Rear default |
+| Rear HQ | 3260x2448 | 14.25 fps | Rear maximum resolution |
+| Rear Fast | 1404x792 | 60 fps | Rear high frame rate |
+| Front Standard | 1292x972 | 57.344 fps | Front default |
+| Front HQ | 2588x1944 | 25 fps | Front high resolution |
 
-GNOME Snapshot exposes Standard and HQ.
+GNOME Snapshot consumes the native PipeWire/libcamera camera nodes.
 
-V4L2 applications such as Signal can use all three profiles through:
+V4L2 applications such as Signal can use all five virtual cameras through:
 
 - /dev/video80 — Rear Standard
 - /dev/video81 — Rear HQ
 - /dev/video82 — Rear Fast
+- /dev/video83 — Front Standard
+- /dev/video84 — Front HQ
 
-Only one real OV8865 sensor stream can be active at a time.
+The rear and front cameras share the physical IPU camera path. Only one
+real physical camera stream is therefore selected at a time.
 
 ## Architecture
 
 Native applications:
 
-    OV8865
+    OV8865 rear / OV5693 front
       -> Intel IPU4P
       -> libcamera SimplePipeline
       -> CPU SoftISP
@@ -58,13 +64,13 @@ Native applications:
 
 V4L2-only applications:
 
-    OV8865
+    OV8865 rear / OV5693 front
       -> Intel IPU4P
       -> libcamera / PipeWire
       -> SP7 on-demand controller
       -> idle relay
       -> v4l2loopback
-      -> /dev/video80, /dev/video81 or /dev/video82
+      -> /dev/video80 ... /dev/video84
       -> application
 
 The controller starts a real camera stream only when a V4L2 client
@@ -116,27 +122,29 @@ the on-demand controller. No v4l2loopback source patch is required.
 
 ## Known limitations
 
-### Rear camera only
+### Front IR camera
 
-This project currently targets the rear OV8865 camera. It does not
-claim complete support for the front RGB or IR cameras.
+The validated front-camera support covers the OV5693 RGB camera. The
+separate front IR camera is outside the scope of this project.
 
 ### One physical stream
 
-The OV8865/IPU4/libcamera stack is treated as a single-owner resource.
-The three V4L2 cameras are therefore virtual profiles, not three
+The rear OV8865 and front OV5693 share the IPU camera resources. The
+five V4L2 cameras are therefore virtual profiles, not five
 simultaneously usable physical streams.
+
+The on-demand controller arbitrates globally between all five V4L2
+profiles. The most recent client-usage transition selects the active
+physical camera profile.
 
 ### Snapshot and Signal at the same time
 
-The current V4L2 controller arbitrates between the three V4L2
-profiles, but it does not arbitrate with a native PipeWire/libcamera
-application.
+The V4L2 controller does not control native PipeWire/libcamera clients.
+Nevertheless, simultaneous GNOME Snapshot and Signal operation was
+successfully tested in the final validation.
 
-Running GNOME Snapshot and Signal at the same time can therefore cause
-the second application to fail to acquire the physical camera.
-
-A future global camera broker could solve this.
+This does not imply that independent rear and front physical sensor
+streams can run concurrently.
 
 ### Autofocus
 

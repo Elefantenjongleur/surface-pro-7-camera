@@ -21,6 +21,8 @@ GRACEPID=""
 STANDARD=0
 HQ=0
 FAST=0
+FRONT_STANDARD=0
+FRONT_HQ=0
 
 STOP_REQUESTED=0
 SELF=$$
@@ -54,7 +56,7 @@ profile()
 {
     case "$1" in
         standard)
-            NODE="sp7.rear.smooth"
+            NODE="sp7.rear.standard"
             WIDTH=1628
             HEIGHT=1224
             FPS_NUM=250000
@@ -78,6 +80,24 @@ profile()
             FPS_NUM=108800000
             FPS_DEN=1813389
             FIFO="$RUNDIR/sp7-camera-fast.fifo"
+            ;;
+
+        front-standard)
+            NODE="sp7.front.standard"
+            WIDTH=1292
+            HEIGHT=972
+            FPS_NUM=7168
+            FPS_DEN=125
+            FIFO="$RUNDIR/sp7-camera-front-standard.fifo"
+            ;;
+
+        front-hq)
+            NODE="sp7.front.hq"
+            WIDTH=2588
+            HEIGHT=1944
+            FPS_NUM=25
+            FPS_DEN=1
+            FIFO="$RUNDIR/sp7-camera-front-hq.fifo"
             ;;
 
         *)
@@ -184,21 +204,55 @@ start_stream()
 
     log "START $WANT -> $NODE (${WIDTH}x${HEIGHT}@${FPS_NUM}/${FPS_DEN})"
 
-    gst-launch-1.0 -q \
-        pipewiresrc \
-            target-object="$NODE" \
-            always-copy=true \
-        ! queue \
-            max-size-buffers=2 \
-            max-size-bytes=0 \
-            max-size-time=0 \
-            leaky=downstream \
-        ! videoconvert \
-        ! video/x-raw,format=YUY2,width="$WIDTH",height="$HEIGHT",framerate="$FPS_NUM/$FPS_DEN" \
-        ! filesink \
-            location="$FIFO" \
-            sync=false \
-        >>"$GSTLOG" 2>&1 &
+    if [ "$WANT" = "front-hq" ]; then
+        gst-launch-1.0 -q \
+            pipewiresrc \
+                target-object="$NODE" \
+                always-copy=true \
+            ! queue \
+                max-size-buffers=2 \
+                max-size-bytes=0 \
+                max-size-time=0 \
+                leaky=downstream \
+            ! videoconvert n-threads=0 \
+            ! video/x-raw,format=YUY2,width="$WIDTH",height="$HEIGHT" \
+            ! filesink \
+                location="$FIFO" \
+                sync=false \
+            >>"$GSTLOG" 2>&1 &
+    elif [ "$WANT" = "front-standard" ]; then
+        gst-launch-1.0 -q \
+            pipewiresrc \
+                target-object="$NODE" \
+                always-copy=true \
+            ! queue \
+                max-size-buffers=2 \
+                max-size-bytes=0 \
+                max-size-time=0 \
+                leaky=downstream \
+            ! videoconvert \
+            ! video/x-raw,format=YUY2,width="$WIDTH",height="$HEIGHT" \
+            ! filesink \
+                location="$FIFO" \
+                sync=false \
+            >>"$GSTLOG" 2>&1 &
+    else
+        gst-launch-1.0 -q \
+            pipewiresrc \
+                target-object="$NODE" \
+                always-copy=true \
+            ! queue \
+                max-size-buffers=2 \
+                max-size-bytes=0 \
+                max-size-time=0 \
+                leaky=downstream \
+            ! videoconvert \
+            ! video/x-raw,format=YUY2,width="$WIDTH",height="$HEIGHT",framerate="$FPS_NUM/$FPS_DEN" \
+            ! filesink \
+                location="$FIFO" \
+                sync=false \
+            >>"$GSTLOG" 2>&1 &
+    fi
 
     GSTPID=$!
     ACTIVE="$WANT"
@@ -240,7 +294,9 @@ handle_grace()
 
     if [ "$STANDARD" -eq 0 ] &&
        [ "$HQ" -eq 0 ] &&
-       [ "$FAST" -eq 0 ]; then
+       [ "$FAST" -eq 0 ] &&
+       [ "$FRONT_STANDARD" -eq 0 ] &&
+       [ "$FRONT_HQ" -eq 0 ]; then
 
         log "Grace abgelaufen – weiterhin alles count=0."
 
@@ -255,7 +311,7 @@ choose_profile()
     LINE="$1"
     WANT=""
 
-    TOTAL=$((STANDARD + HQ + FAST))
+    TOTAL=$((STANDARD + HQ + FAST + FRONT_STANDARD + FRONT_HQ))
 
     if [ "$TOTAL" -eq 0 ]; then
         printf '%s' ""
@@ -267,14 +323,18 @@ choose_profile()
             printf '%s' "standard"
         elif [ "$HQ" -gt 0 ]; then
             printf '%s' "hq"
-        else
+        elif [ "$FAST" -gt 0 ]; then
             printf '%s' "fast"
+        elif [ "$FRONT_STANDARD" -gt 0 ]; then
+            printf '%s' "front-standard"
+        else
+            printf '%s' "front-hq"
         fi
         return
     fi
 
     # Mehrere Reader auf verschiedenen virtuellen Kameras:
-    # Der jüngste count=1-Request gewinnt.
+    # Der jüngste count=1-Request gewinnt global über alle fünf Profile.
     case "$LINE" in
         *"Rear Standard"*"count=1"*)
             WANT="standard"
@@ -284,6 +344,12 @@ choose_profile()
             ;;
         *"Rear Fast"*"count=1"*)
             WANT="fast"
+            ;;
+        *"Front Standard"*"count=1"*)
+            WANT="front-standard"
+            ;;
+        *"Front HQ"*"count=1"*)
+            WANT="front-hq"
             ;;
     esac
 
@@ -300,6 +366,12 @@ choose_profile()
             fast)
                 [ "$FAST" -gt 0 ] && WANT="fast"
                 ;;
+            front-standard)
+                [ "$FRONT_STANDARD" -gt 0 ] && WANT="front-standard"
+                ;;
+            front-hq)
+                [ "$FRONT_HQ" -gt 0 ] && WANT="front-hq"
+                ;;
         esac
     fi
 
@@ -311,6 +383,10 @@ choose_profile()
             WANT="hq"
         elif [ "$FAST" -gt 0 ]; then
             WANT="fast"
+        elif [ "$FRONT_STANDARD" -gt 0 ]; then
+            WANT="front-standard"
+        elif [ "$FRONT_HQ" -gt 0 ]; then
+            WANT="front-hq"
         fi
     fi
 
@@ -350,7 +426,7 @@ trap terminate TERM INT HUP
 log "============================================================"
 log "SP7 Camera Controller gestartet"
 log "Debounce: 2000 ms"
-log "Arbitration: maximal ein realer OV8865-Stream"
+log "Arbitration: maximal ein realer Kamera-Stream"
 log "============================================================"
 
 coproc SP7LISTENER {
@@ -374,13 +450,15 @@ while [ "$STOP_REQUESTED" -eq 0 ] &&
             ;;
     esac
 
-    if [[ "$line" =~ STATE:\ Standard=([0-9]+)\ HQ=([0-9]+)\ Fast=([0-9]+) ]]; then
+    if [[ "$line" =~ STATE:\ Standard=([0-9]+)\ HQ=([0-9]+)\ Fast=([0-9]+)\ FrontStandard=([0-9]+)\ FrontHQ=([0-9]+) ]]; then
 
         STANDARD="${BASH_REMATCH[1]}"
         HQ="${BASH_REMATCH[2]}"
         FAST="${BASH_REMATCH[3]}"
+        FRONT_STANDARD="${BASH_REMATCH[4]}"
+        FRONT_HQ="${BASH_REMATCH[5]}"
 
-        log "CLIENT_USAGE: Standard=$STANDARD HQ=$HQ Fast=$FAST"
+        log "CLIENT_USAGE: Standard=$STANDARD HQ=$HQ Fast=$FAST FrontStandard=$FRONT_STANDARD FrontHQ=$FRONT_HQ"
 
         WANT="$(choose_profile "$line")"
 

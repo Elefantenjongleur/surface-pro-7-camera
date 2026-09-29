@@ -2,41 +2,50 @@
 
 ## Native camera path
 
-The native rear-camera path is:
+The validated Surface Pro 7 camera stack supports two RGB sensors:
 
-    OV8865 RAW10
-        |
-        v
-    Intel IPU4P ISYS
-        |
-        v
-    libcamera SimplePipeline
-        |
-        v
-    CPU Software ISP
-        |
-        v
-    PipeWire / WirePlumber
+    Rear:  OV8865 RAW10 + DW9719 autofocus
+    Front: OV5693 RAW10, fixed focus
+                 |
+                 v
+          Intel IPU4P ISYS
+                 |
+                 v
+        libcamera SimplePipeline
+                 |
+                 v
+          CPU Software ISP
+                 |
+                 v
+        PipeWire / WirePlumber
 
-Three internal PipeWire camera profiles are created:
+Five internal PipeWire camera profiles are created:
 
-    sp7.rear.smooth
+    sp7.rear.standard
     sp7.rear.hq
     sp7.rear.fast
+    sp7.front.standard
+    sp7.front.hq
 
 The normal GNOME camera path uses the native PipeWire/libcamera
 integration.
+
+The internal SPA source profile corresponding to Rear Standard retains
+the historical name `smooth`. WirePlumber maps that source profile to
+the public node `sp7.rear.standard`.
 
 ## V4L2 compatibility path
 
 Some applications do not consume the native PipeWire camera nodes.
 
-For those applications the project provides three v4l2loopback
+For those applications the project provides five v4l2loopback
 devices:
 
     /dev/video80  Rear Standard
     /dev/video81  Rear HQ
     /dev/video82  Rear Fast
+    /dev/video83  Front Standard
+    /dev/video84  Front HQ
 
 Each loopback device has a permanently running lightweight idle relay.
 
@@ -52,15 +61,19 @@ short grace period and then releases the physical camera.
 
 ## Arbitration
 
-Only one real rear-camera profile is allowed to run at a time.
+The rear OV8865 and front OV5693 share the physical IPU camera
+resources. Only one real physical camera profile is selected at a time.
 
-A profile switch therefore follows this order:
+Arbitration is global across all five V4L2 compatibility devices. The
+most recent client-usage transition selects the requested profile.
+
+A profile switch follows this order:
 
     stop old physical stream
     wait for shutdown
     start new physical stream
 
-This avoids concurrent access to the OV8865/IPU4 path.
+This avoids concurrent ownership of the shared IPU camera path.
 
-The current arbitration covers the V4L2 compatibility path only.
-Native PipeWire clients are outside this controller.
+The controller arbitrates the V4L2 compatibility path. Native
+PipeWire/libcamera clients are outside the controller itself.

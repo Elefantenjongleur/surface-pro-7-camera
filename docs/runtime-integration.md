@@ -2,18 +2,27 @@
 
 ## WirePlumber
 
-The custom PipeWire libcamera SPA exposes three Surface Pro 7 rear
-camera profiles.
+The custom PipeWire libcamera SPA exposes five Surface Pro 7 camera
+profiles: three rear profiles and two front profiles.
 
-WirePlumber assigns stable node names:
+WirePlumber assigns stable public node names:
 
-    sp7.rear.smooth
+    sp7.rear.standard
     sp7.rear.hq
     sp7.rear.fast
+    sp7.front.standard
+    sp7.front.hq
 
 The corresponding rules are installed from:
 
     config/wireplumber/wireplumber.conf.d/99-sp7-three-rear-names.conf
+
+The configuration filename is historical. It now contains the naming
+rules for all five profiles and is retained to avoid an unnecessary
+runtime filename change.
+
+The SPA source profile for Rear Standard retains the internal name
+`smooth`; WirePlumber exposes it publicly as `sp7.rear.standard`.
 
 ## WirePlumber environment
 
