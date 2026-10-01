@@ -177,6 +177,18 @@ The installer includes `sp7-audio-fix.service`, which sets only the ALC274
 `Internal Mic Boost` control to `0 dB` through the stable ALSA card ID `PCH`.
 The normal `Capture` and `Digital` gains are left untouched.
 
+Testing showed that WirePlumber/ACP can raise `Internal Mic Boost` back to
+`+30 dB` when the ALSA device is initialized and the PipeWire source volume
+is restored to 100%. The installer therefore also installs a WirePlumber
+rule for the Surface Pro 7 audio device with
+`api.alsa.soft-mixer = true`.
+
+This keeps PipeWire volume and mute handling in software instead of mapping
+them back onto the ALC274 hardware mixer. The known-good hardware values can
+therefore remain at `Internal Mic Boost = 0 dB`, `Capture = +30 dB` and
+`Digital = 0 dB` while the PipeWire microphone volume can independently be
+set to 100%.
+
 The helper is deliberately non-fatal if the expected ALSA card or mixer
 control is not present.
 
