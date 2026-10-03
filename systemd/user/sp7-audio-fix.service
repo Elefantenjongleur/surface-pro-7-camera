@@ -1,6 +1,7 @@
 [Unit]
 Description=Surface Pro 7 internal microphone boost fix
 After=pipewire.service wireplumber.service
+Wants=pipewire.service wireplumber.service
 
 [Service]
 Type=oneshot

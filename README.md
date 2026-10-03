@@ -189,6 +189,14 @@ therefore remain at `Internal Mic Boost = 0 dB`, `Capture = +30 dB` and
 `Digital = 0 dB` while the PipeWire microphone volume can independently be
 set to 100%.
 
+Because WirePlumber/ACP initializes the ALSA device asynchronously,
+starting `sp7-audio-fix.service` after `wireplumber.service` alone is not
+sufficient. The helper therefore waits until the internal PipeWire capture
+source `alsa_input.pci-0000_00_1f.3.analog-stereo` is available, allows a
+short settling period, and only then sets `Internal Mic Boost` to `0 dB`.
+This avoids the boot-time race in which ACP could otherwise restore the
+hardware boost after the fix had already run.
+
 The helper is deliberately non-fatal if the expected ALSA card or mixer
 control is not present.
 

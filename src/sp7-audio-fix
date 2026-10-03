@@ -1,22 +1,53 @@
 #!/usr/bin/env bash
 
-# Surface Pro 7 / Realtek ALC274:
-# The internal microphone may start with +30 dB Internal Mic Boost,
-# causing severe clipping. Keep the hardware boost at 0 dB.
+# Surface Pro 7 / Realtek ALC274
 #
-# This helper is deliberately non-fatal on systems where the expected
-# ALSA card or mixer control does not exist.
+# WirePlumber/ACP initialisiert die ALSA-Karte asynchron.
+# Deshalb reicht systemd "After=wireplumber.service" allein nicht:
+# Der WirePlumber-Prozess kann bereits laufen, während die Audioquelle
+# und die ALSA-Mixerpfade noch eingerichtet werden.
+#
+# Wir warten daher auf die echte interne PipeWire-Aufnahmequelle und
+# setzen Internal Mic Boost erst danach auf den bekannten guten Wert.
 
 CARD="PCH"
 CONTROL="Internal Mic Boost"
+SOURCE="alsa_input.pci-0000_00_1f.3.analog-stereo"
 
 if ! command -v amixer >/dev/null 2>&1; then
     exit 0
 fi
 
+if ! command -v wpctl >/dev/null 2>&1; then
+    exit 0
+fi
+
+# Maximal etwa 30 Sekunden auf die von WirePlumber erzeugte
+# interne Audioquelle warten.
+SOURCE_READY=0
+
+for i in {1..60}; do
+    if wpctl status -n 2>/dev/null |
+       grep -Fq "$SOURCE"; then
+        SOURCE_READY=1
+        break
+    fi
+
+    sleep 0.5
+done
+
+# Falls PipeWire/WirePlumber die Quelle nicht erzeugt hat, den Fix
+# trotzdem versuchen. Das Verhalten bleibt damit fehlertolerant.
 if ! amixer -c "$CARD" scontrols 2>/dev/null |
      grep -Fq "Simple mixer control '$CONTROL',0"; then
     exit 0
 fi
 
+# ACP nach Erscheinen der Quelle noch kurz seine Initialisierung
+# abschließen lassen.
+if [[ "$SOURCE_READY" -eq 1 ]]; then
+    sleep 2
+fi
+
+# Entscheidend: Hardware-Mikrofonboost abschalten.
 amixer -q -c "$CARD" set "$CONTROL" 0
