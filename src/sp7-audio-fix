@@ -12,6 +12,7 @@
 
 CARD="PCH"
 CONTROL="Internal Mic Boost"
+PLAYBACK_CONTROL="Master"
 SOURCE="alsa_input.pci-0000_00_1f.3.analog-stereo"
 
 if ! command -v amixer >/dev/null 2>&1; then
@@ -49,5 +50,14 @@ if [[ "$SOURCE_READY" -eq 1 ]]; then
     sleep 2
 fi
 
-# Entscheidend: Hardware-Mikrofonboost abschalten.
+# Hardware-Mikrofonboost abschalten.
 amixer -q -c "$CARD" set "$CONTROL" 0
+
+# Bei aktiviertem WirePlumber-Soft-Mixer wird der ALSA-Hardware-Master
+# nicht mehr von der normalen PipeWire/GNOME-Lautstärke nachgeführt.
+# Deshalb den bekannten guten Wiedergabewert explizit herstellen:
+# Master = 100 % / 0 dB / unmuted.
+if amixer -c "$CARD" scontrols 2>/dev/null |
+   grep -Fq "Simple mixer control '$PLAYBACK_CONTROL',0"; then
+    amixer -q -c "$CARD" set "$PLAYBACK_CONTROL" 100% unmute
+fi

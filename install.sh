@@ -1108,10 +1108,11 @@ install \
 systemctl --user daemon-reload
 systemctl --user enable sp7-camera-controller.service
 
-# Surface Pro 7 ALC274 internal microphone gain fix.
-# The helper sets the known-good hardware boost to 0 dB.
+# Surface Pro 7 ALC274 hardware mixer fix.
+# The helper sets Internal Mic Boost to the known-good 0 dB and keeps
+# the hardware playback Master at 100% / 0 dB / unmuted.
 # The WirePlumber soft-mixer rule above prevents later PipeWire volume
-# restoration from raising this hardware control back to +30 dB.
+# restoration from changing these hardware mixer values.
 # The helper is non-fatal if the expected ALSA card/control is absent.
 sudo install -Dm755 \
     "$ROOT/src/sp7-audio-fix" \

@@ -1,5 +1,5 @@
 [Unit]
-Description=Surface Pro 7 internal microphone boost fix
+Description=Surface Pro 7 ALC274 hardware mixer fix
 After=pipewire.service wireplumber.service
 Wants=pipewire.service wireplumber.service
 
