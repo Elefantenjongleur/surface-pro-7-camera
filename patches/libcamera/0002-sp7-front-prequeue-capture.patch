@@ -1,0 +1,35 @@
+--- a/src/libcamera/pipeline/simple/simple.cpp
++++ b/src/libcamera/pipeline/simple/simple.cpp
+@@ -1828,6 +1828,23 @@
+ 						      &DelayedControls::applyControls);
+ 	}
+ 
++	/* The SP7 IPU4 OV5693 startup verifier waits for completed captures
++	 * inside STREAMON. Give it capture buffers before entering that ioctl;
++	 * otherwise the empty queue causes 31 pointless sensor restarts.
++	 * Keep the rear sensor, raw streams and converter paths unchanged. */
++	const bool sp7FrontPrequeue = data->sensor_->model() == "ov5693" &&
++		data->useConversion_ && data->swIsp_ && !data->rawStream_;
++	if (sp7FrontPrequeue) {
++		for (const std::unique_ptr<FrameBuffer> &buffer : data->conversionBuffers_) {
++			ret = video->queueBuffer(buffer.get());
++			if (ret < 0) {
++				stop(camera);
++				return ret;
++			}
++		}
++		LOG(SimplePipeline, Info) << "SP7 OV5693: capture buffers queued before STREAMON";
++	}
++
+ 	ret = video->streamOn();
+ 	if (ret < 0) {
+ 		stop(camera);
+@@ -1848,7 +1865,7 @@
+ 		}
+ 
+ 		/* Queue all internal buffers for capture. */
+-		if (!data->rawStream_)
++		if (!data->rawStream_ && !sp7FrontPrequeue)
+ 			for (std::unique_ptr<FrameBuffer> &buffer : data->conversionBuffers_)
+ 				video->queueBuffer(buffer.get());
+ 	}

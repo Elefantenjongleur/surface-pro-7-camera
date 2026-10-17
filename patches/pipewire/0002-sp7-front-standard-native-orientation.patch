@@ -1,0 +1,100 @@
+--- a/spa/plugins/libcamera/libcamera-source.cpp
++++ b/spa/plugins/libcamera/libcamera-source.cpp
+@@ -5,6 +5,9 @@
+ /* SPDX-License-Identifier: MIT */
+ 
+ #include <array>
++#include <chrono>
++#include <fstream>
++#include <thread>
+ #include <cstddef>
+ #include <limits>
+ #include <optional>
+@@ -132,6 +135,7 @@
+ 	 * SensorConfiguration alone cannot distinguish them.
+ 	 */
+ 	bool sp7HqProfile = false;
++	bool sp7FrontStandardProfile = false;
+ 
+ 	static constexpr uint64_t info_all =
+ 		SPA_NODE_CHANGE_MASK_FLAGS |
+@@ -184,6 +188,38 @@
+ 
+ #define GET_OUT_PORT(impl,p)         (&impl->out_ports[p])
+ #define GET_PORT(impl,d,p)           GET_OUT_PORT(impl,p)
++
++/* OV5693 programs mode registers on runtime resume, not ACTIVE set_fmt.
++ * Wait only for the Standard node: before configuring a different mode and
++ * after stopping it, so the next profile can start from a suspended sensor.
++ * This reads power state; it never changes the kernel's PM configuration. */
++int sp7_front_wait_sensor_suspend(struct impl *impl)
++{
++	if (!impl->sp7FrontStandardProfile)
++		return 0;
++
++	const auto deadline = std::chrono::steady_clock::now() +
++		std::chrono::milliseconds(1500);
++	bool waited = false;
++	do {
++		std::ifstream status("/sys/bus/i2c/devices/i2c-INT33BE:00/power/runtime_status");
++		std::string state;
++		if (!(status >> state)) {
++			spa_log_error(impl->log, "SP7 Front Standard: cannot read sensor runtime state");
++			return -EIO;
++		}
++		if (state == "suspended") {
++			if (waited)
++				spa_log_info(impl->log, "SP7 Front Standard: sensor suspended before mode transition");
++			return 0;
++		}
++		waited = true;
++		std::this_thread::sleep_for(std::chrono::milliseconds(20));
++	} while (std::chrono::steady_clock::now() < deadline);
++
++	spa_log_warn(impl->log, "SP7 Front Standard: sensor did not suspend within 1500 ms");
++	return -EBUSY;
++}
+ 
+ void setup_initial_controls(const ControlInfoMap& ctrl_infos, ControlList& ctrls)
+ {
+@@ -867,6 +903,9 @@
+ 
+ 	if ((res = spa_libcamera_open(impl)) < 0)
+ 		return res;
++
++	if ((res = sp7_front_wait_sensor_suspend(impl)) < 0)
++		goto error;
+ 
+ 	res = impl->camera->configure(impl->config.get());
+ 	if (res != 0)
+@@ -1628,6 +1667,8 @@
+ 	impl->completed_requests_rb = SPA_RINGBUFFER_INIT();
+ 	spa_list_init(&port->queue);
+ 
++	/* Stop is complete even if a failed stream delays runtime suspension. */
++	sp7_front_wait_sensor_suspend(impl);
+ 	return 0;
+ }
+ 
+@@ -2601,6 +2642,11 @@
+ 				     sp7Profile);
+ 
+            } else if (spa_streq(sp7Profile, "front-standard")) {
++                   /* OV5693 binning fails with hardware H/V flips. Use the
++                    * native mounting orientation; export it as SPA transform
++                    * metadata instead of asking the sensor to rotate pixels.
++                    * Keep Front HQ and all rear profiles unchanged. */
++                   config->orientation = libcamera::Orientation::Rotate180;
+                    sensorConfig.outputSize = libcamera::Size(1296, 972);
+                    config->sensorConfig = sensorConfig;
+ 
+@@ -2620,6 +2666,9 @@
+         auto *instance = new (handle) impl(log, data_loop, system,
+ 					 std::move(manager), std::move(camera),
+ 					 std::move(config));
++
++	instance->sp7FrontStandardProfile =
++		sp7Profile && spa_streq(sp7Profile, "front-standard");
+ 
+ 	instance->sp7HqProfile =
+ 		sp7Profile && spa_streq(sp7Profile, "hq");

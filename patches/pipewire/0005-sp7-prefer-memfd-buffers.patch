@@ -1,0 +1,16 @@
+--- a/spa/plugins/libcamera/libcamera-source.cpp
++++ b/spa/plugins/libcamera/libcamera-source.cpp
+@@ -1437,10 +1437,10 @@
+ 
+ 		spa_data *d = buffers[0]->datas;
+ 
+-		if (d[0].type != SPA_ID_INVALID && d[0].type & (1u << SPA_DATA_DmaBuf)) {
++		if (d[0].type != SPA_ID_INVALID && d[0].type & (1u << SPA_DATA_MemFd)) {
++			port->memtype = SPA_DATA_MemFd;
++		} else if (d[0].type != SPA_ID_INVALID && d[0].type & (1u << SPA_DATA_DmaBuf)) {
+ 			port->memtype = SPA_DATA_DmaBuf;
+-		} else if (d[0].type != SPA_ID_INVALID && d[0].type & (1u << SPA_DATA_MemFd)) {
+-			port->memtype = SPA_DATA_MemFd;
+ 		} else if (d[0].type & (1u << SPA_DATA_MemPtr)) {
+ 			port->memtype = SPA_DATA_MemPtr;
+ 		} else {

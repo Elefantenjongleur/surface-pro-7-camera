@@ -1,8 +1,8 @@
 diff --git a/spa/plugins/libcamera/libcamera-device.cpp b/spa/plugins/libcamera/libcamera-device.cpp
-index 2d6532f..e127676 100644
+index 2d6532f82..bf2f93c63 100644
 --- a/spa/plugins/libcamera/libcamera-device.cpp
 +++ b/spa/plugins/libcamera/libcamera-device.cpp
-@@ -160,7 +160,101 @@ int emit_info(struct impl *impl, bool full)
+@@ -160,7 +160,176 @@ int emit_info(struct impl *impl, bool full)
  
  	spa_device_emit_info(&impl->hooks, &info);
  
@@ -101,12 +101,87 @@ index 2d6532f..e127676 100644
 +						    profile.id,
 +						    &oinfo);
 +		}
++	} else if (model.find("ov5693") != std::string::npos) {
++		static const struct {
++			uint32_t id;
++			const char *profile;
++			const char *description;
++		} sp7FrontProfiles[] = {
++			{ 0, "front-standard", "Surface Front Standard" },
++			{ 1, "front-hq",       "Surface Front HQ" },
++		};
++
++		for (const auto &profile : sp7FrontProfiles) {
++			struct spa_dict_item nodeItems[64];
++			uint32_t nNodeItems = 0;
++
++			for (uint32_t i = 0;
++			     i < dict.n_items &&
++			     nNodeItems < SPA_N_ELEMENTS(nodeItems) - 5;
++			     ++i) {
++				const char *key = dict.items[i].key;
++
++				if (spa_streq(key, "object.path") ||
++				    spa_streq(key, "node.name") ||
++				    spa_streq(key, "node.description") ||
++				    spa_streq(key, SPA_KEY_API_LIBCAMERA_PATH) ||
++				    spa_streq(key, "api.libcamera.sp7.profile"))
++					continue;
++
++				nodeItems[nNodeItems++] = dict.items[i];
++			}
++
++			std::string objectPath =
++				"libcamera:" + impl->device_id + ":" +
++				profile.profile;
++
++			std::string nodeName =
++				"sp7.front." +
++				std::string(spa_streq(profile.profile, "front-standard")
++					    ? "standard" : "hq");
++
++			std::string profiledApiPath =
++				impl->device_id + "|sp7=" + profile.profile;
++
++			nodeItems[nNodeItems++] = {
++				"object.path", objectPath.c_str()
++			};
++			nodeItems[nNodeItems++] = {
++				"node.name", nodeName.c_str()
++			};
++			nodeItems[nNodeItems++] = {
++				"node.description", profile.description
++			};
++			nodeItems[nNodeItems++] = {
++				SPA_KEY_API_LIBCAMERA_PATH, profiledApiPath.c_str()
++			};
++			nodeItems[nNodeItems++] = {
++				"api.libcamera.sp7.profile", profile.profile
++			};
++
++			struct spa_dict nodeDict =
++				SPA_DICT_INIT(nodeItems, nNodeItems);
++
++			struct spa_device_object_info oinfo;
++
++			oinfo = SPA_DEVICE_OBJECT_INFO_INIT();
++			oinfo.type = SPA_TYPE_INTERFACE_Node;
++			oinfo.factory_name = SPA_NAME_API_LIBCAMERA_SOURCE;
++			oinfo.change_mask =
++				SPA_DEVICE_OBJECT_CHANGE_MASK_PROPS;
++			oinfo.props = &nodeDict;
++
++			spa_device_emit_object_info(&impl->hooks,
++						    profile.id,
++						    &oinfo);
++		}
++
 +	} else {
  		struct spa_device_object_info oinfo;
  
  		oinfo = SPA_DEVICE_OBJECT_INFO_INIT();
 diff --git a/spa/plugins/libcamera/libcamera-source.cpp b/spa/plugins/libcamera/libcamera-source.cpp
-index 1eae218..d4b0660 100644
+index 1eae21812..47ffc904c 100644
 --- a/spa/plugins/libcamera/libcamera-source.cpp
 +++ b/spa/plugins/libcamera/libcamera-source.cpp
 @@ -125,6 +125,14 @@ struct impl {
@@ -150,7 +225,7 @@ index 1eae218..d4b0660 100644
  	}
  	return 0;
  }
-@@ -535,7 +555,52 @@ next_fmt:
+@@ -535,7 +555,66 @@ next_fmt:
  	SizeRange sizeRange;
  	Size frameSize;
  
@@ -180,7 +255,17 @@ index 1eae218..d4b0660 100644
 +		impl->config->sensorConfig &&
 +		impl->config->sensorConfig->outputSize == Size(1632, 918);
 +
-+	if (sp7SmoothEnum || sp7HqNativeEnum || sp7FastNativeEnum) {
++
++        const bool sp7FrontStandardEnum =
++                impl->config->sensorConfig &&
++                impl->config->sensorConfig->outputSize == Size(1296, 972);
++
++        const bool sp7FrontHqEnum =
++                impl->config->sensorConfig &&
++                impl->config->sensorConfig->outputSize == Size(2592, 1944);
++
++        if (sp7SmoothEnum || sp7HqNativeEnum || sp7FastNativeEnum ||
++            sp7FrontStandardEnum || sp7FrontHqEnum) {
 +		/*
 +		 * One size per pixel format only.
 +		 *
@@ -194,17 +279,21 @@ index 1eae218..d4b0660 100644
 +		}
 +
 +		if (sp7SmoothEnum)
-+			frameSize = Size(1628, 1224);
-+		else if (sp7HqNativeEnum)
-+			frameSize = Size(3260, 2448);
-+		else
-+			frameSize = Size(1404, 792);
++                        frameSize = Size(1628, 1224);
++                else if (sp7HqNativeEnum)
++                        frameSize = Size(3260, 2448);
++                else if (sp7FastNativeEnum)
++                        frameSize = Size(1404, 792);
++                else if (sp7FrontStandardEnum)
++                        frameSize = Size(1292, 972);
++                else
++                        frameSize = Size(2588, 1944);
 +	}
 +	else if (!sizes.empty() && port->size_index <= sizes.size()) {
  		if (port->size_index == 0) {
  			Size wanted = Size(640, 480);
  			int best = std::numeric_limits<int>::max();
-@@ -603,6 +668,23 @@ next_fmt:
+@@ -603,6 +682,23 @@ next_fmt:
  		spa_pod_builder_rectangle(&b, frameSize.width, frameSize.height);
  	}
  
@@ -228,7 +317,7 @@ index 1eae218..d4b0660 100644
  	if (streamConfig.colorSpace) {
  		auto colorimetry = color_space_to_colorimetry(*streamConfig.colorSpace);
  
-@@ -675,10 +757,96 @@ int spa_libcamera_set_format(struct impl *impl, struct port *port,
+@@ -675,10 +771,96 @@ int spa_libcamera_set_format(struct impl *impl, struct port *port,
  	streamConfig.size.height = size->height;
  	streamConfig.bufferCount = 8;
  
@@ -325,7 +414,7 @@ index 1eae218..d4b0660 100644
  	if (try_only)
  		return 0;
  
-@@ -1033,6 +1201,18 @@ void handle_completed_request(struct impl *impl, libcamera::Request *request)
+@@ -1033,6 +1215,18 @@ void handle_completed_request(struct impl *impl, libcamera::Request *request)
  
  	const FrameMetadata &fmd = buffer->metadata();
  
@@ -344,7 +433,7 @@ index 1eae218..d4b0660 100644
  	if (impl->clock) {
  		double target = (double)port->info.rate.num / port->info.rate.denom;
  		double corr;
-@@ -1100,6 +1280,18 @@ void handle_completed_request(struct impl *impl, libcamera::Request *request)
+@@ -1100,6 +1294,18 @@ void handle_completed_request(struct impl *impl, libcamera::Request *request)
  		io->buffer_id = b->id;
  		io->status = SPA_STATUS_HAVE_DATA;
  		spa_log_trace(impl->log, "%p: now queued %" PRIu32, impl, b->id);
@@ -363,7 +452,7 @@ index 1eae218..d4b0660 100644
  	}
  
  	spa_node_call_ready(&impl->callbacks, SPA_STATUS_HAVE_DATA);
-@@ -1148,7 +1340,14 @@ const struct {
+@@ -1148,7 +1354,14 @@ const struct {
  	uint32_t spa_transform_value; /* horizontal mirroring then counter-clockwise rotation */
  } orientation_map[] = {
  	{ Orientation::Rotate0, SPA_META_TRANSFORMATION_None },
@@ -379,7 +468,7 @@ index 1eae218..d4b0660 100644
  	{ Orientation::Rotate90, SPA_META_TRANSFORMATION_270 },
  	{ Orientation::Rotate90Mirror, SPA_META_TRANSFORMATION_Flipped90 },
  	{ Orientation::Rotate180, SPA_META_TRANSFORMATION_180 },
-@@ -1215,7 +1414,9 @@ spa_libcamera_alloc_buffers(struct impl *impl, struct port *port,
+@@ -1215,7 +1428,9 @@ spa_libcamera_alloc_buffers(struct impl *impl, struct port *port,
  		if (b->videotransform) {
  			b->videotransform->transform =
  				libcamera_orientation_to_spa_transform_value(impl->config->orientation);
@@ -390,7 +479,7 @@ index 1eae218..d4b0660 100644
  				i, b->videotransform->transform);
  
  		}
-@@ -1581,8 +1782,19 @@ int impl_node_send_command(void *object, const struct spa_command *command)
+@@ -1581,8 +1796,19 @@ int impl_node_send_command(void *object, const struct spa_command *command)
  	spa_return_val_if_fail(impl != nullptr, -EINVAL);
  	spa_return_val_if_fail(command != nullptr, -EINVAL);
  
@@ -410,7 +499,7 @@ index 1eae218..d4b0660 100644
  	{
  		struct port *port = GET_OUT_PORT(impl, 0);
  
-@@ -1596,7 +1808,14 @@ int impl_node_send_command(void *object, const struct spa_command *command)
+@@ -1596,7 +1822,14 @@ int impl_node_send_command(void *object, const struct spa_command *command)
  		break;
  	}
  	case SPA_NODE_COMMAND_Pause:
@@ -425,7 +514,7 @@ index 1eae218..d4b0660 100644
  		if ((res = spa_libcamera_stream_off(impl)) < 0)
  			return res;
  		break;
-@@ -1833,6 +2052,15 @@ int port_set_format(struct impl *impl, struct port *port,
+@@ -1833,6 +2066,15 @@ int port_set_format(struct impl *impl, struct port *port,
  {
  	const bool try_only = SPA_FLAG_IS_SET(flags, SPA_NODE_PARAM_FLAG_TEST_ONLY);
  
@@ -441,7 +530,7 @@ index 1eae218..d4b0660 100644
  	if (!try_only) {
  		spa_libcamera_stream_off(impl);
  		spa_libcamera_clear_buffers(port);
-@@ -1879,10 +2107,31 @@ int port_set_format(struct impl *impl, struct port *port,
+@@ -1879,10 +2121,31 @@ int port_set_format(struct impl *impl, struct port *port,
  			return -EINVAL;
  		}
  
@@ -473,7 +562,7 @@ index 1eae218..d4b0660 100644
  		if (!try_only)
  			port->current_format = info;
  	}
-@@ -1947,7 +2196,23 @@ int impl_node_port_use_buffers(void *object,
+@@ -1947,7 +2210,23 @@ int impl_node_port_use_buffers(void *object,
  
  	port = GET_PORT(impl, direction, port_id);
  
@@ -497,7 +586,7 @@ index 1eae218..d4b0660 100644
  		spa_libcamera_stream_off(impl);
  		if ((res = spa_libcamera_clear_buffers(port)) < 0)
  			return res;
-@@ -2009,6 +2274,11 @@ int impl_node_port_reuse_buffer(void *object,
+@@ -2009,6 +2288,11 @@ int impl_node_port_reuse_buffer(void *object,
  
  	spa_return_val_if_fail(buffer_id < port->n_buffers, -EINVAL);
  
@@ -509,7 +598,7 @@ index 1eae218..d4b0660 100644
  	res = spa_libcamera_buffer_recycle(impl, port, buffer_id);
  
  	return res;
-@@ -2056,7 +2326,16 @@ int impl_node_process(void *object)
+@@ -2056,7 +2340,16 @@ int impl_node_process(void *object)
  
  	spa_log_trace(impl->log, "%p: status %d", impl, io->status);
  
@@ -526,7 +615,7 @@ index 1eae218..d4b0660 100644
  		return SPA_STATUS_HAVE_DATA;
  	}
  
-@@ -2080,6 +2359,11 @@ int impl_node_process(void *object)
+@@ -2080,6 +2373,11 @@ int impl_node_process(void *object)
  	io->buffer_id = b->id;
  	io->status = SPA_STATUS_HAVE_DATA;
  
@@ -538,7 +627,7 @@ index 1eae218..d4b0660 100644
  	return SPA_STATUS_HAVE_DATA;
  }
  
-@@ -2198,13 +2482,40 @@ impl_init(const struct spa_handle_factory *factory,
+@@ -2198,13 +2496,40 @@ impl_init(const struct spa_handle_factory *factory,
  		return res;
  	}
  
@@ -582,7 +671,7 @@ index 1eae218..d4b0660 100644
  		return -ENOENT;
  	}
  
-@@ -2214,9 +2525,71 @@ impl_init(const struct spa_handle_factory *factory,
+@@ -2214,9 +2539,86 @@ impl_init(const struct spa_handle_factory *factory,
  		return -EINVAL;
  	}
  
@@ -641,10 +730,25 @@ index 1eae218..d4b0660 100644
 +			spa_log_info(log,
 +				     "SP7 profile %s: sensor 1632x918 full-FOV test",
 +				     sp7Profile);
-+		}
++
++           } else if (spa_streq(sp7Profile, "front-standard")) {
++                   sensorConfig.outputSize = libcamera::Size(1296, 972);
++                   config->sensorConfig = sensorConfig;
++
++                   spa_log_info(log,
++                                "SP7 profile front-standard: sensor 1296x972");
++           } else if (spa_streq(sp7Profile, "front-hq")) {
++                   sensorConfig.outputSize = libcamera::Size(2592, 1944);
++                   config->sensorConfig = sensorConfig;
++
++                   spa_log_info(log,
++                                "SP7 profile front-hq: sensor 2592x1944");
++
 +	}
 +
-+	auto *instance = new (handle) impl(log, data_loop, system,
++	        }
++
++        auto *instance = new (handle) impl(log, data_loop, system,
 +					 std::move(manager), std::move(camera),
 +					 std::move(config));
 +

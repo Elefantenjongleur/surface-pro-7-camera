@@ -39,6 +39,11 @@ Five camera profiles are provided:
 
 GNOME Snapshot consumes the native PipeWire/libcamera camera nodes.
 
+The front profiles include corrected client orientation and startup/reopen
+handling while retaining Front Standard's sensor-orientation workaround.
+The [October 17 camera cleanup validation](docs/camera-validation-2026-10-17.md)
+records all-five-profile captures and rapid switching checks.
+
 V4L2 applications such as Signal can use all five virtual cameras through:
 
 - /dev/video80 — Rear Standard

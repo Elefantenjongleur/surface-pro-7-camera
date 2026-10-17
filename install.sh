@@ -397,7 +397,7 @@ else
         mokutil \
         v4l-utils \
         gstreamer1 \
-        gstreamer1-tools \
+        gstreamer1-plugins-base-tools \
         gstreamer1-plugins-base
 fi
 
@@ -721,6 +721,18 @@ apply_patch \
     "$LIBCAMERA_SRC" \
     "$ROOT/patches/libcamera/0001-sp7-camera.patch"
 
+apply_patch \
+    "$LIBCAMERA_SRC" \
+    "$ROOT/patches/libcamera/0002-sp7-front-prequeue-capture.patch"
+
+apply_patch \
+    "$LIBCAMERA_SRC" \
+    "$ROOT/patches/libcamera/0003-sp7-front-capture-metadata.patch"
+
+apply_patch \
+    "$LIBCAMERA_SRC" \
+    "$ROOT/patches/libcamera/0004-sp7-rear-cold-exposure.patch"
+
 [[ -f "$LIBCAMERA_SRC/src/ipa/simple/data/ov8865.yaml" ]] \
     || die "OV8865 tuning file is missing from the libcamera patch."
 
@@ -813,6 +825,22 @@ fetch_commit \
 apply_patch \
     "$PIPEWIRE_SRC" \
     "$ROOT/patches/pipewire/0001-sp7-libcamera-profiles.patch"
+
+apply_patch \
+    "$PIPEWIRE_SRC" \
+    "$ROOT/patches/pipewire/0002-sp7-front-standard-native-orientation.patch"
+
+apply_patch \
+    "$PIPEWIRE_SRC" \
+    "$ROOT/patches/pipewire/0003-sp7-front-standard-client-orientation.patch"
+
+apply_patch \
+    "$PIPEWIRE_SRC" \
+    "$ROOT/patches/pipewire/0004-sp7-front-hq-client-orientation.patch"
+
+apply_patch \
+    "$PIPEWIRE_SRC" \
+    "$ROOT/patches/pipewire/0005-sp7-prefer-memfd-buffers.patch"
 
 SP7_ORIGINAL_PKG_CONFIG_PATH="${PKG_CONFIG_PATH:-}"
 
@@ -1075,6 +1103,18 @@ install \
     -m 0644 \
     "$ROOT/config/wireplumber/wireplumber.conf.d/99-sp7-three-rear-names.conf" \
     "$WP_DIR/99-sp7-three-rear-names.conf"
+
+install \
+    -m 0644 \
+    "$ROOT/config/wireplumber/wireplumber.conf.d/98-sp7-camera-seat.conf" \
+    "$WP_DIR/98-sp7-camera-seat.conf"
+
+WP_SCRIPTS="${XDG_DATA_HOME:-$HOME/.local/share}/wireplumber/scripts/sp7"
+mkdir -p "$WP_SCRIPTS"
+install \
+    -m 0644 \
+    "$ROOT/config/wireplumber/scripts/sp7/libcamera-seat-monitor.lua" \
+    "$WP_SCRIPTS/libcamera-seat-monitor.lua"
 
 # Keep the ALC274 hardware mixer at the known-good microphone gain.
 # WirePlumber still controls source/sink volume in software.

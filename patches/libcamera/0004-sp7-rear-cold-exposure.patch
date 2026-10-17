@@ -1,0 +1,52 @@
+--- a/src/libcamera/pipeline/simple/simple.cpp
++++ b/src/libcamera/pipeline/simple/simple.cpp
+@@ -347,6 +347,7 @@
+ 	V4L2VideoDevice *video_;
+ 	V4L2Subdevice *frameStartEmitter_;
+ 	uint32_t sp7FrontSequence_ = 0;
++	bool sp7RearStartSeen_ = false;
+ 
+ 	std::vector<Configuration> configs_;
+ 	std::map<PixelFormat, std::vector<const Configuration *>> formats_;
+@@ -1831,6 +1832,41 @@
+ 
+ 	video->bufferReady.connect(data, &SimpleCameraData::imageBufferReady);
+ 
++	/* OV8865 boots with 32 lines at unity gain, even though configuring
++	 * a capture mode permits a much longer frame-length exposure. SoftISP's
++	 * bounded AGC takes seconds to climb from this boot value. Seed only
++	 * the first processed rear start in that untouched boot state; retain
++	 * settled controls on later opens and leave raw/front paths unchanged.
++	 */
++	if (data->sensor_->model() == "ov8865" && data->useConversion_ &&
++	    data->swIsp_ && !data->rawStream_ && !data->sp7RearStartSeen_) {
++		data->sp7RearStartSeen_ = true;
++		/* Video-node format propagation can update the sensor defaults. */
++		data->sensor_->device()->updateControlInfo();
++		const uint32_t ids[] = { V4L2_CID_EXPOSURE, V4L2_CID_ANALOGUE_GAIN };
++		ControlList current = data->sensor_->device()->getControls(ids);
++		const auto &infos = data->sensor_->controls();
++		auto exposure = infos.find(V4L2_CID_EXPOSURE);
++		auto gain = infos.find(V4L2_CID_ANALOGUE_GAIN);
++
++		if (exposure != infos.end() && gain != infos.end() &&
++		    current.contains(V4L2_CID_EXPOSURE) &&
++		    current.contains(V4L2_CID_ANALOGUE_GAIN) &&
++		    current.get(V4L2_CID_EXPOSURE).get<int32_t>() == 32 &&
++		    current.get(V4L2_CID_ANALOGUE_GAIN).get<int32_t>() ==
++			gain->second.def().get<int32_t>()) {
++			ControlList initial(infos);
++			initial.set(V4L2_CID_EXPOSURE, exposure->second.max());
++			LOG(SimplePipeline, Info) << "SP7 OV8865: seeding boot exposure to "
++				<< exposure->second.max().toString();
++			ret = data->sensor_->setControls(&initial);
++			if (ret < 0) {
++				stop(camera);
++				return ret;
++			}
++		}
++	}
++
+ 	data->delayedCtrls_->reset();
+ 	if (frameStartEmitter) {
+ 		ret = frameStartEmitter->setFrameStartEnabled(true);

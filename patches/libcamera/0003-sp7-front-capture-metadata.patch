@@ -1,0 +1,45 @@
+--- a/src/libcamera/pipeline/simple/simple.cpp
++++ b/src/libcamera/pipeline/simple/simple.cpp
+@@ -42,6 +42,7 @@
+ #include "libcamera/internal/delayed_controls.h"
+ #include "libcamera/internal/device_enumerator.h"
+ #include "libcamera/internal/formats.h"
++#include "libcamera/internal/framebuffer.h"
+ #include "libcamera/internal/global_configuration.h"
+ #include "libcamera/internal/media_device.h"
+ #include "libcamera/internal/pipeline_handler.h"
+@@ -345,6 +346,7 @@
+ 	std::unique_ptr<CameraSensor> sensor_;
+ 	V4L2VideoDevice *video_;
+ 	V4L2Subdevice *frameStartEmitter_;
++	uint32_t sp7FrontSequence_ = 0;
+ 
+ 	std::vector<Configuration> configs_;
+ 	std::map<PixelFormat, std::vector<const Configuration *>> formats_;
+@@ -951,6 +953,18 @@
+ 		conversionQueue_.pop();
+ 
+ 		return;
++	}
++
++	/* SP7 OV5693 firmware SOF matching can report sequence zero and
++	 * timestamps that underflow or run backwards after a reopen. Use the
++	 * monotonic capture-dequeue time before SoftISP processing instead.
++	 * This is an arrival-time approximation, not an exposure-start time.
++	 * Do not alter rear, raw-only or hardware-converter metadata. */
++	if (sensor_->model() == "ov5693" && useConversion_ && swIsp_ && !rawStream_) {
++		FrameMetadata &metadata = buffer->_d()->metadata();
++		metadata.timestamp = std::chrono::duration_cast<std::chrono::nanoseconds>(
++			utils::clock::now().time_since_epoch()).count();
++		metadata.sequence = sp7FrontSequence_++;
+ 	}
+ 
+ 	/*
+@@ -1835,6 +1849,7 @@
+ 	const bool sp7FrontPrequeue = data->sensor_->model() == "ov5693" &&
+ 		data->useConversion_ && data->swIsp_ && !data->rawStream_;
+ 	if (sp7FrontPrequeue) {
++		data->sp7FrontSequence_ = 0;
+ 		for (const std::unique_ptr<FrameBuffer> &buffer : data->conversionBuffers_) {
+ 			ret = video->queueBuffer(buffer.get());
+ 			if (ret < 0) {

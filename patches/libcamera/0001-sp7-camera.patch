@@ -106,6 +106,22 @@ index 112d9f5a1..b3e986018 100644
  };
  
  } /* namespace ipa::soft::algorithms */
+diff --git a/src/ipa/simple/data/ov8865.yaml b/src/ipa/simple/data/ov8865.yaml
+new file mode 100644
+index 000000000..f5b3b72d6
+--- /dev/null
++++ b/src/ipa/simple/data/ov8865.yaml
+@@ -0,0 +1,10 @@
++# SPDX-License-Identifier: CC0-1.0
++
++version: 1
++
++algorithms:
++  - BlackLevel:
++      blackLevel: 1024
++  - Awb:
++  - Adjust:
++  - Agc:
 diff --git a/src/ipa/simple/soft_simple.cpp b/src/ipa/simple/soft_simple.cpp
 index 629e1a32d..4fb4c3a0a 100644
 --- a/src/ipa/simple/soft_simple.cpp
@@ -524,7 +540,7 @@ index 629e1a32d..4fb4c3a0a 100644
  
  std::string IPASoftSimple::logPrefix() const
 diff --git a/src/libcamera/pipeline/simple/simple.cpp b/src/libcamera/pipeline/simple/simple.cpp
-index e26f438d9..468229092 100644
+index e26f438d9..b6f248d3b 100644
 --- a/src/libcamera/pipeline/simple/simple.cpp
 +++ b/src/libcamera/pipeline/simple/simple.cpp
 @@ -24,6 +24,7 @@
@@ -752,28 +768,6 @@ index e26f438d9..468229092 100644
  		return data->swIsp_->configure(inputCfg, outputCfgs, configInfo);
  	}
  }
-@@ -1924,6 +2077,21 @@ bool SimplePipelineHandler::matchDevice(std::shared_ptr<MediaDevice> media,
- 	pipelines.reserve(sensors.size());
- 
- 	for (MediaEntity *sensor : sensors) {
-+		/*
-+		 * Surface Pro 7 rear-only test.
-+		 *
-+		 * The OV5693 front camera currently fails to produce frames
-+		 * with the IPU4P stack and can leave ISYS requiring a power
-+		 * cycle. Temporarily exclude it while testing the OV8865 rear
-+		 * camera through PipeWire/Snapshot.
-+		 */
-+		if (sensor->name().find("ov5693") != std::string::npos) {
-+			LOG(SimplePipeline, Info)
-+				<< "SP7 rear-only test: skipping OV5693 sensor "
-+				<< sensor->name();
-+			continue;
-+		}
-+
- 		std::unique_ptr<SimpleCameraData> data =
- 			std::make_unique<SimpleCameraData>(this, numStreams, sensor);
- 		if (!data->isValid()) {
 diff --git a/src/libcamera/software_isp/debayer_cpu.cpp b/src/libcamera/software_isp/debayer_cpu.cpp
 index 49382b4c2..b4d0049c2 100644
 --- a/src/libcamera/software_isp/debayer_cpu.cpp
@@ -1229,19 +1223,3 @@ index 7fb77ce7d..d95e3f6d3 100644
  			for (unsigned int j = 0; j < SwIspStats::kYHistogramSize; j++)
  				sharedStats_->yHistogram[j] += s.yHistogram[j];
  		}
-diff --git a/src/ipa/simple/data/ov8865.yaml b/src/ipa/simple/data/ov8865.yaml
-new file mode 100644
-index 000000000..f5b3b72d6
---- /dev/null
-+++ b/src/ipa/simple/data/ov8865.yaml
-@@ -0,0 +1,10 @@
-+# SPDX-License-Identifier: CC0-1.0
-+
-+version: 1
-+
-+algorithms:
-+  - BlackLevel:
-+      blackLevel: 1024
-+  - Awb:
-+  - Adjust:
-+  - Agc:
